@@ -17,10 +17,14 @@ from fastcode.graph.persistence import (
     save_graph,
     save_meta,
 )
+from fastcode.graph.staleness import _current_git_commit
 from fastcode.graph.validation import strip_invalid_edges
 from fastcode.symbol_backend.protocol import SymbolProvider
 
 from .assembler import Assembler
+from .derived_artifacts import ArtifactOptions, build_derived_artifacts
+from .runtime import _provider_backend_name, _provider_serena_available
+from .semantic_enricher import SemanticEnricher
 from .validator import validate_pipeline_result
 
 logger = logging.getLogger(__name__)
@@ -113,6 +117,12 @@ def incremental_update(
     graph.edges = surviving_edges + assembly.edges
 
     graph, _ = strip_invalid_edges(graph)
+    graph = SemanticEnricher().enrich(graph)
+    graph = build_derived_artifacts(
+        graph,
+        project_root,
+        ArtifactOptions(persist=False),
+    ).graph
 
     # ------------------------------------------------------------------
     # 5. Validate & persist
@@ -125,19 +135,19 @@ def incremental_update(
     # Update meta
     try:
         old_meta = load_meta(project_root)
-        symbol_backend = old_meta.symbol_backend
-        runtime_mode = old_meta.runtime_mode
-        serena_available = old_meta.serena_available
+        previous_symbol_backend = old_meta.symbol_backend
     except FileNotFoundError:
-        symbol_backend = "ast"  # type: ignore[assignment]
-        runtime_mode = "restricted"  # type: ignore[assignment]
-        serena_available = False
+        previous_symbol_backend = "ast"  # type: ignore[assignment]
+
+    serena_available = _provider_serena_available(provider)
+    symbol_backend = _provider_backend_name(provider) or previous_symbol_backend
+    runtime_mode = "full" if serena_available else "restricted"
 
     meta = AnalysisMeta(
         graph_version="2.0",
         backend_version="0.2.0",
         last_analyzed_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        git_commit_hash="",
+        git_commit_hash=_current_git_commit(project_root) or "",
         analyzed_files=len(changed_files),
         changed_files=[str(fp) for fp in changed_files],
         analysis_mode="incremental",

@@ -38,10 +38,15 @@ class QueryRouter:
         4. Produce answer.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        code_retriever: CodeRetriever | None = None,
+        packer: ContextPacker | None = None,
+    ) -> None:
         self._answering = GraphAnswering()
-        self._augmenter = GraphAugmentedRetriever(CodeRetriever())
-        self._packer = ContextPacker(ContextBudget())
+        self._augmenter = GraphAugmentedRetriever(code_retriever or CodeRetriever())
+        self._packer = packer or ContextPacker(ContextBudget())
 
     def route(self, query: str, container: ServiceContainer) -> RouteResult:
         """Route *query* using services in *container*.

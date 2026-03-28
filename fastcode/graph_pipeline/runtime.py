@@ -13,11 +13,14 @@ from pathlib import Path
 
 from fastcode.graph.models import AnalysisMeta, KnowledgeGraph, ProjectMeta
 from fastcode.graph.persistence import save_graph, save_meta
+from fastcode.graph.staleness import _current_git_commit
 from fastcode.graph.validation import strip_invalid_edges, validate_graph
 from fastcode.symbol_backend.protocol import SymbolProvider
 
 from .assembler import Assembler
+from .derived_artifacts import ArtifactOptions, build_derived_artifacts
 from .scanner import Scanner
+from .semantic_enricher import SemanticEnricher
 from .structural_analyzer import StructuralAnalyzer
 from .validator import validate_pipeline_result
 
@@ -25,6 +28,22 @@ logger = logging.getLogger(__name__)
 
 _GRAPH_VERSION = "2.0"
 _BACKEND_VERSION = "0.2.0"
+
+
+def _provider_backend_name(provider: SymbolProvider) -> str:
+    value = getattr(provider, "backend_name", "ast")
+    if callable(value):
+        value = value()
+    return str(value)
+
+
+def _provider_serena_available(provider: SymbolProvider) -> bool:
+    value = getattr(provider, "serena_available", False)
+    if callable(value):
+        value = value()
+    if isinstance(value, bool):
+        return value
+    return False
 
 
 def build_graph(
@@ -80,30 +99,42 @@ def build_graph(
     if stripped_issues:
         logger.info("build_graph: stripped %d invalid edge(s)", len(stripped_issues))
 
-    # 6. Pipeline validation
+    # 6. Optional semantic enrichment (safe no-op without an LLM)
+    graph = SemanticEnricher().enrich(graph)
+
+    # 7. Build derived artifacts that later query flows rely on
+    artifact_result = build_derived_artifacts(
+        graph,
+        project_root,
+        ArtifactOptions(persist=False),
+    )
+    graph = artifact_result.graph
+
+    # 8. Pipeline validation
     pipeline_val = validate_pipeline_result(graph)
     if not pipeline_val.valid:
         for issue in pipeline_val.issues:
             logger.warning("Pipeline issue [%s]: %s", issue.severity, issue.message)
 
-    # 7. Graph structural validation
+    # 9. Graph structural validation
     graph_val = validate_graph(graph)
     issues_to_save = pipeline_val.issues + graph_val.issues
 
-    # 8. Persist
+    # 10. Persist
     save_graph(graph, project_root, strict=strict_save, issues=issues_to_save)
 
-    # 9. Persist AnalysisMeta
+    # 11. Persist AnalysisMeta
+    serena_available = _provider_serena_available(provider)
     meta = AnalysisMeta(
         graph_version=_GRAPH_VERSION,
         backend_version=_BACKEND_VERSION,
         last_analyzed_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        git_commit_hash="",
+        git_commit_hash=_current_git_commit(project_root) or "",
         analyzed_files=analysis_result.analyzed_files,
         analysis_mode="full",
-        symbol_backend=provider.backend_name,  # type: ignore[arg-type]
-        serena_available=False,
-        runtime_mode="restricted",
+        symbol_backend=_provider_backend_name(provider),  # type: ignore[arg-type]
+        serena_available=serena_available,
+        runtime_mode="full" if serena_available else "restricted",
         warnings_count=sum(1 for i in issues_to_save if i.severity == "warning"),
     )
     save_meta(meta, project_root)

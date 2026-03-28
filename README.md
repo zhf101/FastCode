@@ -51,6 +51,7 @@ FastCode is a token-efficient framework for comprehensive code understanding and
 - Multi-Language Support - Python, JavaScript, TypeScript, Java, Go, C/C++, Rust, C#
 - Multi-Repository Reasoning - Cross-repo dependency analysis
 - Small Model Support - Local model compatibility (qwen3-coder-30b)
+- **Graph-First Dual-Layer Architecture** - Knowledge graph as the primary understanding layer, with retrieval augmentation as a secondary layer for implementation details
 
 ### 💻 User Experience
 - **MCP Server** - Use FastCode directly through MCP integration (e.g., Cursor, Claude Code)
@@ -79,6 +80,22 @@ FastCode introduces a three-phase framework that transforms how LLMs understand 
 <p align="center">
   <img src="assets/framework.png" alt="FastCode Framework" width="100%"/>
 </p>
+
+## 🏗️ Graph-First Dual-Layer Architecture
+
+FastCode uses a two-layer architecture where the **Knowledge Graph is always the primary source of understanding**. Retrieval augmentation acts strictly as a secondary supplement — it is not the system center.
+
+| Layer | Component | Role |
+|-------|-----------|------|
+| **Layer 1 (Primary)** | Knowledge Graph (`graph/`, `graph_services/`) | Structural understanding: nodes, edges, layers, intent routing |
+| **Layer 2 (Augmentation)** | Retrieval Runtime (`retrieval_runtime/`) | Implementation details when graph context is insufficient |
+
+**How augmentation is controlled:**
+- `GraphAugmentedRetriever` triggers only when graph nodes lack real summaries (abstract nodes exceed threshold)
+- `ContextBudget` ensures graph content always gets priority in the context window (default 60% reserved for graph)
+- `ContextPacker` assembles the final prompt with graph section first, retrieval appended only if budget allows
+- Query intents `explain`, `diff`, and `onboard` use pure graph paths — augmentation applies only to `graph_qa` / `hybrid_detail` / `unknown` intents
+- Current graph build is structurally strongest for Python projects. Other source extensions are still scanned and retained in repository metadata, but graph detail may remain sparse until symbol backends expand beyond the current Python-first AST path.
 
 ## 🏗️ Semantic-Structural Code Representation
 

@@ -46,6 +46,9 @@ class HybridProvider(SymbolProvider):
         file_path: Path,
         content: str,
     ) -> tuple[list[SymbolInfo], list[RelationshipInfo]]:
+        if not self._serena.is_available():
+            return self._ast.analyze_file(file_path, content)
+
         if self._serena.is_available():
             symbols, rels = self._serena.analyze_file(file_path, content)
             # Serena may have marked itself unavailable during the call
