@@ -1,0 +1,1 @@
+"""FastCode graph asset kernel."""
