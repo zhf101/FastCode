@@ -97,6 +97,14 @@ FastCode uses a two-layer architecture where the **Knowledge Graph is always the
 - Query intents `explain`, `diff`, and `onboard` use pure graph paths — augmentation applies only to `graph_qa` / `hybrid_detail` / `unknown` intents
 - Current graph build is structurally strongest for Python projects. Other source extensions are still scanned and retained in repository metadata, but graph detail may remain sparse until symbol backends expand beyond the current Python-first AST path.
 
+## Graph-First Runtime Status
+
+- Default package runtime: `from fastcode import FastCode` now resolves to the graph-first facade.
+- Legacy escape hatch: `from fastcode import LegacyFastCode` is still available for rollback and compatibility debugging.
+- Build path: `graph_pipeline.build_graph()` for full builds plus `graph_pipeline.incremental_updater.incremental_update()` for refresh.
+- Query path: `app.QueryRouter` for single-repository graph-first answers, with bounded retrieval augmentation only when graph context is insufficient.
+- Compatibility strategy: streaming, multi-repository, cache/session, and vector-store-heavy flows still delegate through the legacy runtime behind the facade until those surfaces are fully migrated.
+
 ## 🏗️ Semantic-Structural Code Representation
 
 ### Multi-layered codebase understanding for comprehensive analysis

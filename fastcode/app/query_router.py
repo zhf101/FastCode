@@ -13,6 +13,7 @@ from fastcode.retrieval_runtime.code_retriever import CodeRetriever
 from fastcode.retrieval_runtime.context_budget import ContextBudget
 from fastcode.retrieval_runtime.context_packer import ContextPacker
 from fastcode.retrieval_runtime.graph_augmented_retriever import GraphAugmentedRetriever
+from fastcode.retrieval_runtime.iterative_retriever import IterativeRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +46,19 @@ class QueryRouter:
         code_retriever: CodeRetriever | None = None,
         packer: ContextPacker | None = None,
     ) -> None:
+        retriever = code_retriever or CodeRetriever()
         self._answering = GraphAnswering()
-        self._augmenter = GraphAugmentedRetriever(code_retriever or CodeRetriever())
+        self._augmenter = GraphAugmentedRetriever(retriever)
+        self._iterative = IterativeRetriever(retriever)
         self._packer = packer or ContextPacker(ContextBudget())
 
-    def route(self, query: str, container: ServiceContainer) -> RouteResult:
+    def route(
+        self,
+        query: str,
+        container: ServiceContainer,
+        *,
+        use_agency_mode: bool = False,
+    ) -> RouteResult:
         """Route *query* using services in *container*.
 
         Always succeeds — errors are surfaced in the answer text.
@@ -90,7 +99,7 @@ class QueryRouter:
             # graph_qa / hybrid_detail / unknown — use general context + augmentation
             ctx = container.context_builder.build(graph, query)
             answer = self._answering.answer(query, ctx, restricted=False)
-            answer = self._augment_if_needed(query, ctx, answer)
+            answer = self._augment_answer(query, ctx, answer, use_agency_mode=use_agency_mode)
             sources = self._sources_from_nodes(graph.project.name, ctx.relevant_nodes)
 
         return RouteResult(
@@ -103,14 +112,19 @@ class QueryRouter:
     # Intent-specific handlers
     # ------------------------------------------------------------------
 
-    def _augment_if_needed(
-        self, query: str, ctx: QueryContext, answer: AnswerResult
+    def _augment_answer(
+        self,
+        query: str,
+        ctx: QueryContext,
+        answer: AnswerResult,
+        *,
+        use_agency_mode: bool,
     ) -> AnswerResult:
-        """Augment answer with retrieval snippets if graph context has gaps."""
-        aug = self._augmenter.augment_from_graph_gap(query, ctx)
-        if not aug.triggered or not aug.has_content:
+        snippets = self._agency_augmentation_snippets(query) if use_agency_mode else self._graph_gap_snippets(query, ctx)
+        if not snippets:
             return answer
-        packed = self._packer.pack(ctx, aug.snippets)
+
+        packed = self._packer.pack(ctx, snippets)
         augmented_text = answer.answer + "\n\n" + packed.text
         return AnswerResult(
             query=answer.query,
@@ -119,6 +133,27 @@ class QueryRouter:
             context_edges=answer.context_edges,
             restricted_mode=answer.restricted_mode,
         )
+
+    def _graph_gap_snippets(
+        self,
+        query: str,
+        ctx: QueryContext,
+    ):
+        """Return graph-gap snippets when normal augmentation decides they are needed."""
+        aug = self._augmenter.augment_from_graph_gap(query, ctx)
+        if not aug.triggered or not aug.has_content:
+            return []
+        return aug.snippets
+
+    def _agency_augmentation_snippets(
+        self,
+        query: str,
+    ):
+        """Return iterative retrieval snippets for agency-compatible mode."""
+        aug = self._iterative.retrieve(query, max_results=10)
+        if aug.error or not aug.snippets:
+            return []
+        return aug.snippets
 
     def _handle_explain(self, query: str, graph) -> tuple[AnswerResult, list[dict[str, object]]]:
         from fastcode.graph_services.explain_service import (

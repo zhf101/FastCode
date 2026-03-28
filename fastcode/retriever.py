@@ -245,148 +245,227 @@ class HybridRetriever:
             self.logger.info(f"Retrieving for query: {query_str}")
         
         # Determine if agency mode should be used
-        should_use_agency = self.enable_agency_mode
+        should_use_agency = self._resolve_agency_mode(use_agency_mode)
 
-        # ========================================
-        # STEP 1: Repository Selection (Independent of agency mode)
-        # Select relevant repositories based on overview if configured
-        # ========================================
+        repo_filter = self._resolve_repository_scope(
+            search_text4repo_selection=search_text4repo_selection,
+            keywords=keywords,
+            repo_filter=repo_filter,
+        )
 
-        if self.select_repos_by_overview:
-            # Check if we have multiple repositories
-            available_repos = self.vector_store.get_repository_names()
+        if self._should_run_iterative_agency_mode(should_use_agency):
+            final_results = self._run_iterative_agency_retrieval(
+                query=query_str,
+                query_info=query_info,
+                repo_filter=repo_filter,
+                dialogue_history=dialogue_history,
+            )
+            return self._finalize_retrieval_results(final_results, repo_filter)
 
-            # Determine the effective repo list: user's selection (repo_filter) or all available repos
-            # If user explicitly selected specific repos via repo_filter, use that count
-            effective_repos = repo_filter if repo_filter else available_repos
+        final_results = self._run_standard_retrieval_pipeline(
+            query_str=query_str,
+            search_text4semantic=search_text4semantic,
+            keywords=keywords,
+            pseudocode=pseudocode,
+            filters=filters,
+            repo_filter=repo_filter,
+        )
 
-            if len(effective_repos) > 1:
-                self.logger.info(f"Multi-repository scenario detected ({len(effective_repos)} repos)")
+        final_results = self._apply_retrieval_enhancements(
+            query=query_str,
+            results=final_results,
+            query_info=query_info,
+            repo_filter=repo_filter,
+            enable_file_selection=enable_file_selection,
+            should_use_agency=should_use_agency,
+        )
+        return self._finalize_retrieval_results(final_results, repo_filter)
 
-                if self.repo_selection_method == "llm":
-                    # LLM-based repo selection with robust fuzzy matching
-                    selected_repos = self._select_relevant_repositories_by_llm(
-                        search_text4repo_selection, self.top_repos_to_search,
-                        scope_repos=repo_filter
-                    )
-                else:
-                    # Legacy embedding+BM25-based repo selection
-                    selected_repos = self._select_relevant_repositories(
-                        search_text4repo_selection, keywords, self.top_repos_to_search
-                    )
+    def _resolve_agency_mode(self, use_agency_mode: Optional[bool]) -> bool:
+        """Resolve agency mode using explicit per-call override first."""
+        if use_agency_mode is None:
+            return self.enable_agency_mode
+        return bool(use_agency_mode)
 
-                if selected_repos:
-                    repo_filter = selected_repos
-                    self.logger.info(f"Selected repositories by overview: {repo_filter}")
-                else:
-                    self.logger.warning("No repositories selected, searching all")
-            else:
-                # Single repo mode - no need to call LLM for repo selection
-                self.logger.info(f"Single repository mode ({effective_repos}), skipping LLM repo selection")
+    def _resolve_repository_scope(
+        self,
+        *,
+        search_text4repo_selection: str,
+        keywords: Optional[List[str]],
+        repo_filter: Optional[List[str]],
+    ) -> Optional[List[str]]:
+        if not self.select_repos_by_overview:
+            return repo_filter
 
-        # ========================================
-        # STEP 2: Choose Retrieval Mode (Agency or Standard)
-        # ========================================
+        available_repos = self.vector_store.get_repository_names()
+        effective_repos = repo_filter if repo_filter else available_repos
+        if len(effective_repos) <= 1:
+            self.logger.info(f"Single repository mode ({effective_repos}), skipping LLM repo selection")
+            return repo_filter
 
-        # If using iterative agency mode, use agency-based retrieval
-        if should_use_agency and self.iterative_agent:
-            self.logger.info("Using iterative agency mode for retrieval")
+        self.logger.info(f"Multi-repository scenario detected ({len(effective_repos)} repos)")
+        if self.repo_selection_method == "llm":
+            selected_repos = self._select_relevant_repositories_by_llm(
+                search_text4repo_selection,
+                self.top_repos_to_search,
+                scope_repos=repo_filter,
+            )
+        else:
+            selected_repos = self._select_relevant_repositories(
+                search_text4repo_selection,
+                keywords,
+                self.top_repos_to_search,
+            )
 
-            # Ensure repos are loaded if needed
-            if repo_filter and self.current_loaded_repos != repo_filter:
-                self.logger.info("Reloading specific repository indexes for iterative mode")
-                if self.reload_specific_repositories(repo_filter):
-                    self.current_loaded_repos = repo_filter
+        if selected_repos:
+            self.logger.info(f"Selected repositories by overview: {selected_repos}")
+            return selected_repos
 
-            # Go directly to iterative agency mode with dialogue_history
-            final_results = self._apply_agency_mode(query_str, [], query_info, repo_filter, dialogue_history)
+        self.logger.warning("No repositories selected, searching all")
+        return repo_filter
 
-            # Final safety check
-            if repo_filter:
-                final_results = self._final_repo_filter(final_results, repo_filter)
+    def _should_run_iterative_agency_mode(self, should_use_agency: bool) -> bool:
+        return should_use_agency and self.iterative_agent is not None
 
-            return final_results
+    def _run_iterative_agency_retrieval(
+        self,
+        *,
+        query: str,
+        query_info: Dict[str, Any],
+        repo_filter: Optional[List[str]],
+        dialogue_history: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        self.logger.info("Using iterative agency mode for retrieval")
+        self._reload_repository_scope(
+            repo_filter,
+            reason="iterative mode",
+            clear_on_failure=False,
+            warn_on_failure=False,
+        )
+        return self._apply_agency_mode(query, [], query_info, repo_filter, dialogue_history)
 
-        # ========================================
-        # STEP 3: Standard Retrieval Mode
-        # ========================================
+    def _run_standard_retrieval_pipeline(
+        self,
+        *,
+        query_str: str,
+        search_text4semantic: str,
+        keywords: Optional[List[str]],
+        pseudocode: Optional[str],
+        filters: Optional[Dict[str, Any]],
+        repo_filter: Optional[List[str]],
+    ) -> List[Dict[str, Any]]:
+        self._reload_repository_scope(repo_filter, reason="accurate retrieval")
 
-        # Reload specific repository indexes for accurate retrieval
-        if repo_filter:
-            self.logger.info(f"Filtering by repositories: {repo_filter}")
-            
-            # Always reload when the requested repositories change to avoid stale indexes
-            if self.current_loaded_repos != repo_filter:
-                self.logger.info("Reloading specific repository indexes for accurate retrieval")
-                if self.reload_specific_repositories(repo_filter):
-                    self.current_loaded_repos = repo_filter
-                else:
-                    self.logger.warning("Failed to reload specific repositories, using filtered search")
-                    self.current_loaded_repos = None
-        
-        # CRITICAL: Always pass repo_filter for safety, even when using filtered indexes
-        # The search methods will apply appropriate filtering based on which index they use
-        
-        # Stage 1: Semantic search (use enhanced query text)
         semantic_results = self._semantic_search(search_text4semantic, top_k=20, repo_filter=repo_filter)
-        
-        # Stage 1b: Pseudocode-based search (if available)
+
         pseudocode_results = []
         if pseudocode:
             pseudocode_results = self._semantic_search(pseudocode, top_k=10, repo_filter=repo_filter)
             self.logger.info(f"Pseudocode search found {len(pseudocode_results)} additional results")
-        
-        # Stage 2: Keyword search (use enhanced keywords if available)
+
         keyword_query = " ".join(keywords) if keywords else query_str
         keyword_results = self._keyword_search(keyword_query, top_k=10, repo_filter=repo_filter)
-        
-        # Stage 3: Combine and score (include pseudocode results)
+
         combined_results = self._combine_results(
-            semantic_results, keyword_results, pseudocode_results
+            semantic_results,
+            keyword_results,
+            pseudocode_results,
         )
-        
-        # # Stage 4: Graph expansion
-        # if self.graph_weight > 0:
-        #     combined_results = self._expand_with_graph(combined_results, max_hops=2)
-        
-        # Stage 5: Re-rank
         final_results = self._rerank(query_str, combined_results)
-        
-        # Stage 6: Apply filters
+
         if filters:
             final_results = self._apply_filters(final_results, filters)
-        
-        # Stage 7: Diversification
+
         final_results = self._diversify(final_results)
-        
-        # Limit results
         final_results = final_results[:self.max_results]
-        
         self.logger.info(f"Retrieved {len(final_results)} elements")
-        
-        # Optional: LLM-based file selection (single or multi-repo) - only if not using agency mode
-        if enable_file_selection and not should_use_agency:
-            self.logger.info("Using file selection for accurate and comprehensive retrieval")
-            self.logger.info(f"enable_file_selection: {enable_file_selection}")
-            self.logger.info(f"should_use_agency: {should_use_agency}")
-            target_repos = repo_filter or self.vector_store.get_repository_names()
-            if target_repos:
-                final_results = self._enhance_with_file_selection(
-                    query_str, final_results, target_repos
-                )
-        
-        # Agency mode: accurate search + association lookup
+        return final_results
+
+    def _reload_repository_scope(
+        self,
+        repo_filter: Optional[List[str]],
+        *,
+        reason: str,
+        clear_on_failure: bool = True,
+        warn_on_failure: bool = True,
+    ) -> None:
+        if not repo_filter:
+            return
+
+        self.logger.info(f"Filtering by repositories: {repo_filter}")
+        if self.current_loaded_repos == repo_filter:
+            return
+
+        self.logger.info(f"Reloading specific repository indexes for {reason}")
+        if self.reload_specific_repositories(repo_filter):
+            self.current_loaded_repos = repo_filter
+            return
+
+        if warn_on_failure:
+            self.logger.warning("Failed to reload specific repositories, using filtered search")
+        if clear_on_failure:
+            self.current_loaded_repos = None
+
+    def _apply_retrieval_enhancements(
+        self,
+        *,
+        query: str,
+        results: List[Dict[str, Any]],
+        query_info: Dict[str, Any],
+        repo_filter: Optional[List[str]],
+        enable_file_selection: bool,
+        should_use_agency: bool,
+    ) -> List[Dict[str, Any]]:
+        final_results = results
+
+        final_results = self._maybe_enhance_with_file_selection(
+            query=query,
+            results=final_results,
+            repo_filter=repo_filter,
+            enable_file_selection=enable_file_selection,
+            should_use_agency=should_use_agency,
+        )
+
         if should_use_agency:
             self.logger.info("Using agency mode for accurate and comprehensive retrieval")
-            final_results = self._apply_agency_mode(query_str, final_results, query_info, repo_filter)
-        
-        # Final safety check: ensure only results from selected repos are returned
-        # This is the last line of defense to catch any leaks from earlier stages
+            final_results = self._apply_agency_mode(query, final_results, query_info, repo_filter)
+
+        return final_results
+
+    def _maybe_enhance_with_file_selection(
+        self,
+        *,
+        query: str,
+        results: List[Dict[str, Any]],
+        repo_filter: Optional[List[str]],
+        enable_file_selection: bool,
+        should_use_agency: bool,
+    ) -> List[Dict[str, Any]]:
+        if not enable_file_selection or should_use_agency:
+            return results
+
+        self.logger.info("Using file selection for accurate and comprehensive retrieval")
+        self.logger.info(f"enable_file_selection: {enable_file_selection}")
+        self.logger.info(f"should_use_agency: {should_use_agency}")
+        target_repos = repo_filter or self.vector_store.get_repository_names()
+        if not target_repos:
+            return results
+
+        return self._enhance_with_file_selection(
+            query,
+            results,
+            target_repos,
+        )
+
+    def _finalize_retrieval_results(
+        self,
+        results: List[Dict[str, Any]],
+        repo_filter: Optional[List[str]],
+    ) -> List[Dict[str, Any]]:
         if repo_filter:
             self.logger.debug(f"Applying final repo filter: {repo_filter}")
-            final_results = self._final_repo_filter(final_results, repo_filter)
-        
-        return final_results
+            return self._final_repo_filter(results, repo_filter)
+        return results
     
     def _select_relevant_repositories(self, query: Union[str, List[str]], keywords: Optional[List[str]], top_k: int = 5) -> List[str]:
         """
@@ -611,13 +690,10 @@ class HybridRetriever:
             self.logger.warning("No repository overviews found in retrieval phase")
             return results
         
-        # Use LLM to select relevant files
-        scenario_mode = "single" if len(repo_names) == 1 else "multi"
-        selected_files = self.repo_selector.select_relevant_files(
-            query,
-            repo_overviews,
-            max_files=self.max_files_to_search,
-            scenario_mode=scenario_mode,
+        selected_files = self._select_files_for_query(
+            query=query,
+            repo_names=repo_names,
+            repo_overviews=repo_overviews,
         )
         
         if not selected_files:
@@ -626,40 +702,64 @@ class HybridRetriever:
         
         self.logger.info(f"LLM selected {len(selected_files)} specific files")
         
-        # Retrieve elements from selected files
         file_elements = self._retrieve_elements_from_files(selected_files)
-        
-        # Merge with existing results (prioritize LLM-selected files)
-        # Add selected file elements with boosted scores
-        enhanced_results = []
-        seen_ids = set()
-        
-        # First add LLM-selected file elements with boosted score
-        for elem_data in file_elements:
+        return self._merge_file_selection_results(
+            selected_file_results=file_elements,
+            existing_results=results,
+        )
+
+    def _select_files_for_query(
+        self,
+        *,
+        query: str,
+        repo_names: List[str],
+        repo_overviews: List[Dict[str, Any]],
+    ) -> List[Dict[str, str]]:
+        """Ask the repository selector for concrete files relevant to the query."""
+        scenario_mode = "single" if len(repo_names) == 1 else "multi"
+        return self.repo_selector.select_relevant_files(
+            query,
+            repo_overviews,
+            max_files=self.max_files_to_search,
+            scenario_mode=scenario_mode,
+        )
+
+    def _merge_file_selection_results(
+        self,
+        *,
+        selected_file_results: List[Dict[str, Any]],
+        existing_results: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Merge LLM-selected file results ahead of existing retrieval results."""
+        enhanced_results: List[Dict[str, Any]] = []
+        seen_ids: Set[str] = set()
+
+        for elem_data in selected_file_results:
             elem_id = elem_data["element"].get("id")
-            if elem_id and elem_id not in seen_ids:
-                # Boost LLM-selected elements - apply to all score components
-                boost_factor = 1.3
-                elem_data["total_score"] *= boost_factor
-                elem_data["semantic_score"] *= boost_factor
-                elem_data["keyword_score"] *= boost_factor
-                elem_data["pseudocode_score"] *= boost_factor
-                elem_data["graph_score"] *= boost_factor
-                elem_data["llm_selected"] = True
-                enhanced_results.append(elem_data)
-                seen_ids.add(elem_id)
-        
-        # Then add original results
-        for elem_data in results:
+            if not elem_id or elem_id in seen_ids:
+                continue
+            boosted = self._boost_file_selected_result(elem_data)
+            enhanced_results.append(boosted)
+            seen_ids.add(elem_id)
+
+        for elem_data in existing_results:
             elem_id = elem_data["element"].get("id")
-            if elem_id and elem_id not in seen_ids:
-                enhanced_results.append(elem_data)
-                seen_ids.add(elem_id)
-        
-        # Re-sort by score
+            if not elem_id or elem_id in seen_ids:
+                continue
+            enhanced_results.append(elem_data)
+            seen_ids.add(elem_id)
+
         enhanced_results.sort(key=lambda x: x["total_score"], reverse=True)
-        
         return enhanced_results
+
+    @staticmethod
+    def _boost_file_selected_result(elem_data: Dict[str, Any], boost_factor: float = 1.3) -> Dict[str, Any]:
+        """Boost scores for elements that came from explicit LLM file selection."""
+        boosted = dict(elem_data)
+        for key in ("total_score", "semantic_score", "keyword_score", "pseudocode_score", "graph_score"):
+            boosted[key] *= boost_factor
+        boosted["llm_selected"] = True
+        return boosted
     
     def _get_repository_overviews(self, repo_names: List[str]) -> List[Dict[str, Any]]:
         """Get repository overview information for given repo names from separate storage"""
@@ -1140,78 +1240,14 @@ class HybridRetriever:
         self.logger.info(f"Reloading specific repositories into filtered indexes: {repo_names}")
         
         try:
-            # Create/clear filtered vector store (separate from main vector store)
-            if self.filtered_vector_store is None:
-                self.filtered_vector_store = VectorStore(self.config)
-                self.filtered_vector_store.initialize(self.embedder.embedding_dim)
-            else:
-                self.filtered_vector_store.clear()
-            
-            # Load each repository's vector index and merge into FILTERED store
-            loaded_count = 0
-            for repo_name in repo_names:
-                self.logger.info(f"Loading vector index for {repo_name}...")
-                if self.filtered_vector_store.merge_from_index(repo_name):
-                    self.logger.info(f"Successfully loaded {repo_name} vector index")
-                    loaded_count += 1
-                else:
-                    self.logger.warning(f"Failed to load vector index for {repo_name}")
+            loaded_count = self._reload_filtered_vector_store(repo_names)
             
             if loaded_count == 0:
                 self.logger.error("Failed to load any repository vector indexes")
                 return False
             
-            # Reload BM25 indexes for specific repositories into FILTERED indexes
-            all_bm25_elements = []
-            all_bm25_corpus = []
-            
-            for repo_name in repo_names:
-                bm25_path = os.path.join(self.persist_dir, f"{repo_name}_bm25.pkl")
-                if os.path.exists(bm25_path):
-                    try:
-                        with open(bm25_path, 'rb') as f:
-                            data = pickle.load(f)
-                            all_bm25_corpus.extend(data["bm25_corpus"])
-                            
-                            # Reconstruct CodeElement objects
-                            for elem_dict in data["bm25_elements"]:
-                                all_bm25_elements.append(CodeElement(**elem_dict))
-                        
-                        self.logger.info(f"Loaded BM25 index for {repo_name}")
-                    except Exception as e:
-                        self.logger.warning(f"Failed to load BM25 index for {repo_name}: {e}")
-                else:
-                    self.logger.warning(f"BM25 index not found for {repo_name}")
-            
-            # Rebuild FILTERED BM25 with selected repositories
-            if all_bm25_elements and all_bm25_corpus:
-                self.filtered_bm25_elements = all_bm25_elements
-                self.filtered_bm25_corpus = all_bm25_corpus
-                self.filtered_bm25 = BM25Okapi(all_bm25_corpus)
-                self.logger.info(f"Rebuilt filtered BM25 index with {len(all_bm25_elements)} elements")
-            else:
-                self.logger.warning("No BM25 data found for the specified repositories")
-            
-            # Optionally reload graph data (if needed)
-            # Note: Graph reloading is commented out since it might not be necessary for all use cases
-            # Uncomment if graph data needs to be reloaded as well
-            # for i, repo_name in enumerate(repo_names):
-            #     if i == 0:
-            #         self.graph_builder.load(repo_name)
-            #     else:
-            #         self.graph_builder.merge_from_file(repo_name)
-            
-            # Update iterative_agent's bm25_elements reference to use filtered elements
-            if self.iterative_agent is not None:
-                self.iterative_agent.bm25_elements = self.filtered_bm25_elements
-                self.logger.info("Updated iterative_agent with filtered BM25 elements")
-            
-            # Update iterative_agent's repo stats if needed
-            if self.iterative_agent is not None:
-                repo_stats = self._calculate_repo_stats()
-                if repo_stats:
-                    self.iterative_agent.set_repo_stats(repo_stats)
-                    self.logger.info("Updated iterative_agent with repo stats")
+            self._reload_filtered_bm25_indexes(repo_names)
+            self._sync_iterative_agent_state()
             
             self.logger.info(
                 f"Successfully reloaded {loaded_count} repositories with "
@@ -1225,6 +1261,83 @@ class HybridRetriever:
             import traceback
             self.logger.error(traceback.format_exc())
             return False
+
+    def _reload_filtered_vector_store(self, repo_names: List[str]) -> int:
+        """Reload filtered vector store from repository-specific persisted indexes."""
+        if self.filtered_vector_store is None:
+            self.filtered_vector_store = VectorStore(self.config)
+            self.filtered_vector_store.initialize(self.embedder.embedding_dim)
+        else:
+            self.filtered_vector_store.clear()
+
+        loaded_count = 0
+        for repo_name in repo_names:
+            self.logger.info(f"Loading vector index for {repo_name}...")
+            if self.filtered_vector_store.merge_from_index(repo_name):
+                self.logger.info(f"Successfully loaded {repo_name} vector index")
+                loaded_count += 1
+            else:
+                self.logger.warning(f"Failed to load vector index for {repo_name}")
+        return loaded_count
+
+    def _reload_filtered_bm25_indexes(self, repo_names: List[str]) -> None:
+        """Reload filtered BM25 corpus and elements for the selected repositories."""
+        all_bm25_elements: List[CodeElement] = []
+        all_bm25_corpus: List[List[str]] = []
+
+        for repo_name in repo_names:
+            repo_corpus, repo_elements = self._load_repo_bm25_payload(repo_name)
+            all_bm25_corpus.extend(repo_corpus)
+            all_bm25_elements.extend(repo_elements)
+
+        self._assign_filtered_bm25(all_bm25_corpus, all_bm25_elements)
+
+    def _load_repo_bm25_payload(self, repo_name: str) -> Tuple[List[List[str]], List[CodeElement]]:
+        """Load one repository's persisted BM25 payload."""
+        bm25_path = os.path.join(self.persist_dir, f"{repo_name}_bm25.pkl")
+        if not os.path.exists(bm25_path):
+            self.logger.warning(f"BM25 index not found for {repo_name}")
+            return [], []
+
+        try:
+            with open(bm25_path, 'rb') as f:
+                data = pickle.load(f)
+            corpus = data["bm25_corpus"]
+            elements = [CodeElement(**elem_dict) for elem_dict in data["bm25_elements"]]
+            self.logger.info(f"Loaded BM25 index for {repo_name}")
+            return corpus, elements
+        except Exception as e:
+            self.logger.warning(f"Failed to load BM25 index for {repo_name}: {e}")
+            return [], []
+
+    def _assign_filtered_bm25(
+        self,
+        bm25_corpus: List[List[str]],
+        bm25_elements: List[CodeElement],
+    ) -> None:
+        """Assign filtered BM25 state from the reloaded repository payloads."""
+        self.filtered_bm25_elements = bm25_elements
+        self.filtered_bm25_corpus = bm25_corpus
+        if bm25_elements and bm25_corpus:
+            self.filtered_bm25 = BM25Okapi(bm25_corpus)
+            self.logger.info(f"Rebuilt filtered BM25 index with {len(bm25_elements)} elements")
+            return
+
+        self.filtered_bm25 = None
+        self.logger.warning("No BM25 data found for the specified repositories")
+
+    def _sync_iterative_agent_state(self) -> None:
+        """Update iterative agent inputs after filtered repository indexes change."""
+        if self.iterative_agent is None:
+            return
+
+        self.iterative_agent.bm25_elements = self.filtered_bm25_elements
+        self.logger.info("Updated iterative_agent with filtered BM25 elements")
+
+        repo_stats = self._calculate_repo_stats()
+        if repo_stats:
+            self.iterative_agent.set_repo_stats(repo_stats)
+            self.logger.info("Updated iterative_agent with repo stats")
     
     def save_bm25(self, name: str = "index"):
         """
@@ -1404,35 +1517,20 @@ class HybridRetriever:
         self.logger.info("Applying iterative agency mode")
 
         try:
-            # Use iterative agent if available
-            if self.iterative_agent:
-                # Get processed query (should be in query_info or we need to pass it)
-                from .query_processor import ProcessedQuery
-
-                # Create a ProcessedQuery object from query_info
-                processed_query = ProcessedQuery(
-                    original=query,
-                    expanded=query_info.get("expanded", query),
-                    keywords=query_info.get("keywords", []),
-                    intent=query_info.get("intent", "unknown"),
-                    subqueries=[],
-                    filters=query_info.get("filters", {}),
-                    rewritten_query=query_info.get("rewritten_query"),
-                    pseudocode_hints=query_info.get("pseudocode_hints")
-                )
-
-                final_results, iteration_metadata = self.iterative_agent.retrieve_with_iteration(
-                    query, processed_query, query_info, repo_filter, dialogue_history
-                )
-
-                self.logger.info(f"Iterative agent completed: {iteration_metadata}")
-
-                return final_results
-
-            # Fallback: iterative agent not available
-            else:
+            if not self.iterative_agent:
                 self.logger.warning("Iterative agent not available, returning original results")
                 return results
+
+            processed_query = self._build_processed_query_for_agency(query, query_info)
+            final_results, iteration_metadata = self._run_iterative_agent(
+                query,
+                processed_query,
+                query_info,
+                repo_filter,
+                dialogue_history,
+            )
+            self.logger.info(f"Iterative agent completed: {iteration_metadata}")
+            return final_results
 
         except Exception as e:
             self.logger.error(f"Error in agency mode: {e}")
@@ -1440,4 +1538,36 @@ class HybridRetriever:
             self.logger.error(traceback.format_exc())
             # Fallback to original results
             return results
+
+    def _build_processed_query_for_agency(self, query: str, query_info: Dict[str, Any]):
+        """Build a ProcessedQuery payload for iterative agency mode."""
+        from .query_processor import ProcessedQuery
+
+        return ProcessedQuery(
+            original=query,
+            expanded=query_info.get("expanded", query),
+            keywords=query_info.get("keywords", []),
+            intent=query_info.get("intent", "unknown"),
+            subqueries=[],
+            filters=query_info.get("filters", {}),
+            rewritten_query=query_info.get("rewritten_query"),
+            pseudocode_hints=query_info.get("pseudocode_hints"),
+        )
+
+    def _run_iterative_agent(
+        self,
+        query: str,
+        processed_query,
+        query_info: Dict[str, Any],
+        repo_filter: Optional[List[str]] = None,
+        dialogue_history: Optional[List[Dict[str, Any]]] = None,
+    ):
+        """Execute the iterative agent with the prepared ProcessedQuery."""
+        return self.iterative_agent.retrieve_with_iteration(
+            query,
+            processed_query,
+            query_info,
+            repo_filter,
+            dialogue_history,
+        )
 

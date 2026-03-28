@@ -1,4 +1,4 @@
-"""CodeRetriever — minimal retrieval interface wrapping legacy FastCode HybridRetriever.
+"""CodeRetriever — minimal retrieval interface wrapping the current retrieval backend.
 
 This module is an augmentation layer. It must not become the primary query entry.
 Use only when graph context is insufficient for implementation-level questions.
@@ -38,7 +38,7 @@ class RetrievalResult:
 
 
 class CodeRetriever:
-    """Thin wrapper that extracts retrieval from the legacy HybridRetriever.
+    """Thin wrapper that extracts retrieval from the configured HybridRetriever.
 
     Constructed with an optional backend; if the backend is unavailable,
     all calls return an empty RetrievalResult — no crash, no exception.
@@ -55,10 +55,10 @@ class CodeRetriever:
             logger.info("CodeRetriever: no backend provided, running in no-op mode")
 
     @classmethod
-    def from_legacy(cls, config: dict, repo_root: str | Path | None = None) -> "CodeRetriever":
-        """Try to construct from legacy FastCode config.
+    def from_runtime_config(cls, config: dict, repo_root: str | Path | None = None) -> "CodeRetriever":
+        """Construct from the current FastCode runtime config.
 
-        Falls back to no-op if legacy dependencies are unavailable.
+        Falls back to no-op if retrieval dependencies are unavailable.
         """
         try:
             from fastcode.vector_store import VectorStore
@@ -76,8 +76,13 @@ class CodeRetriever:
             )
             return cls(backend)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("CodeRetriever.from_legacy failed, using no-op: %s", exc)
+            logger.warning("CodeRetriever.from_runtime_config failed, using no-op: %s", exc)
             return cls(backend=None)
+
+    @classmethod
+    def from_legacy(cls, config: dict, repo_root: str | Path | None = None) -> "CodeRetriever":
+        """Backward-compatible alias for legacy call sites."""
+        return cls.from_runtime_config(config, repo_root=repo_root)
 
     def retrieve(self, query: str, *, max_results: int = 5) -> RetrievalResult:
         """Retrieve code snippets relevant to *query*.

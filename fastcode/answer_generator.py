@@ -193,6 +193,95 @@ class AnswerGenerator:
                 "error": full_error,
             }
 
+    def generate_from_context(
+        self,
+        query: str,
+        context: str,
+        *,
+        query_info: Optional[Dict[str, Any]] = None,
+        dialogue_history: Optional[List[Dict[str, Any]]] = None,
+        prompt_builder: Optional[Callable[[str, str, Optional[Dict[str, Any]], Optional[List[Dict[str, Any]]]], str]] = None,
+    ) -> Dict[str, Any]:
+        """Generate an answer from an already prepared context string."""
+        self.logger.info("Generating answer from prepared context")
+
+        if prompt_builder:
+            prompt = prompt_builder(query, context, query_info, dialogue_history)
+        else:
+            prompt = self._build_prompt(query, context, query_info, dialogue_history)
+
+        prompt_tokens = count_tokens(prompt, self.model)
+        self.logger.info(f"Initial prompt tokens: {prompt_tokens}")
+
+        available_input_tokens = self.max_context_tokens - self.max_tokens - self.reserve_tokens
+        if prompt_tokens > available_input_tokens:
+            self.logger.warning(
+                f"Prompt exceeds limit ({prompt_tokens} > {available_input_tokens} tokens). "
+                f"Truncating context to fit. (max_context_tokens={self.max_context_tokens}, "
+                f"max_tokens={self.max_tokens}, reserve={self.reserve_tokens})"
+            )
+
+            system_prompt_sample = self._build_prompt(query, "", query_info, dialogue_history)
+            base_tokens = count_tokens(system_prompt_sample, self.model)
+            context_token_budget = available_input_tokens - base_tokens - 100
+
+            if context_token_budget > 0:
+                context = self._truncate_context(context, context_token_budget)
+                self.logger.info(f"Context truncated to ~{context_token_budget} tokens")
+            else:
+                self.logger.error(
+                    f"Cannot fit prompt even without context! "
+                    f"Base tokens: {base_tokens}, available: {available_input_tokens}"
+                )
+                context = ""
+
+            if prompt_builder:
+                prompt = prompt_builder(query, context, query_info, dialogue_history)
+            else:
+                prompt = self._build_prompt(query, context, query_info, dialogue_history)
+
+            prompt_tokens = count_tokens(prompt, self.model)
+            self.logger.info(f"Final prompt tokens after truncation: {prompt_tokens}")
+
+        try:
+            if self.provider == "openai":
+                raw_response = self._generate_openai(prompt)
+            elif self.provider == "anthropic":
+                raw_response = self._generate_anthropic(prompt)
+            else:
+                raw_response = "Error: LLM provider not configured"
+
+            if self.enable_multi_turn and dialogue_history is not None:
+                answer, summary = self._parse_response_with_summary(raw_response)
+                if not summary:
+                    self.logger.info("Generating fallback summary from prepared context")
+                    summary = raw_response[:500]
+            else:
+                answer = raw_response
+                summary = None
+
+            result = {
+                "answer": answer,
+                "query": query,
+                "context_elements": 0,
+                "prompt_tokens": prompt_tokens,
+                "sources": [],
+            }
+            if summary:
+                result["summary"] = summary
+            return result
+        except Exception as e:
+            self.logger.error(f"Failed to generate answer from prepared context: {e}")
+            import traceback
+            full_error = traceback.format_exc()
+            self.logger.error(f"Full error traceback:\n{full_error}")
+            return {
+                "answer": f"Error generating answer: {str(e)}",
+                "query": query,
+                "context_elements": 0,
+                "error": full_error,
+            }
+
     def generate_stream(self, query: str, retrieved_elements: List[Dict[str, Any]],
                        query_info: Optional[Dict[str, Any]] = None,
                        dialogue_history: Optional[List[Dict[str, Any]]] = None,
@@ -317,6 +406,99 @@ class AnswerGenerator:
             self.logger.error(f"Full error traceback:\n{full_error}")
             error_msg = f"Error generating answer: {str(e)}"
             yield error_msg, {"error": full_error, "complete": True}
+
+    def generate_stream_from_context(
+        self,
+        query: str,
+        context: str,
+        *,
+        query_info: Optional[Dict[str, Any]] = None,
+        dialogue_history: Optional[List[Dict[str, Any]]] = None,
+        prompt_builder: Optional[Callable[[str, str, Optional[Dict[str, Any]], Optional[List[Dict[str, Any]]]], str]] = None,
+    ):
+        """Generate a streaming answer from an already prepared context string."""
+        self.logger.info("Generating streaming answer from prepared context")
+
+        if prompt_builder:
+            prompt = prompt_builder(query, context, query_info, dialogue_history)
+        else:
+            prompt = self._build_prompt(query, context, query_info, dialogue_history)
+
+        prompt_tokens = count_tokens(prompt, self.model)
+        self.logger.info(f"Initial prompt tokens: {prompt_tokens}")
+
+        available_input_tokens = self.max_context_tokens - self.max_tokens - self.reserve_tokens
+        if prompt_tokens > available_input_tokens:
+            self.logger.warning(
+                f"Prompt exceeds limit ({prompt_tokens} > {available_input_tokens} tokens). Truncating context."
+            )
+
+            system_prompt_sample = self._build_prompt(query, "", query_info, dialogue_history)
+            base_tokens = count_tokens(system_prompt_sample, self.model)
+            context_token_budget = available_input_tokens - base_tokens - 100
+
+            if context_token_budget > 0:
+                context = self._truncate_context(context, context_token_budget)
+                self.logger.info(f"Context truncated to ~{context_token_budget} tokens")
+            else:
+                self.logger.error("Cannot fit prompt even without context!")
+                context = ""
+
+            if prompt_builder:
+                prompt = prompt_builder(query, context, query_info, dialogue_history)
+            else:
+                prompt = self._build_prompt(query, context, query_info, dialogue_history)
+
+            prompt_tokens = count_tokens(prompt, self.model)
+            self.logger.info(f"Final prompt tokens after truncation: {prompt_tokens}")
+
+        yield None, {
+            "prompt_tokens": prompt_tokens,
+            "sources": [],
+            "context_elements": 0,
+            "query": query,
+        }
+
+        filter_summary = self.enable_multi_turn and dialogue_history is not None
+
+        try:
+            full_response = []
+
+            if filter_summary:
+                for original_chunk, filtered_chunk in self._stream_with_summary_filter(prompt):
+                    if original_chunk:
+                        full_response.append(original_chunk)
+                    if filtered_chunk:
+                        yield filtered_chunk, None
+            else:
+                if self.provider == "openai":
+                    for chunk in self._generate_openai_stream(prompt):
+                        full_response.append(chunk)
+                        yield chunk, None
+                elif self.provider == "anthropic":
+                    for chunk in self._generate_anthropic_stream(prompt):
+                        full_response.append(chunk)
+                        yield chunk, None
+                else:
+                    yield "Error: LLM provider not configured", None
+
+            raw_response = "".join(full_response)
+            summary = None
+            if filter_summary:
+                answer, summary = self._parse_response_with_summary(raw_response)
+                if not summary:
+                    summary = raw_response[:500]
+
+            final_metadata = {"complete": True}
+            if summary:
+                final_metadata["summary"] = summary
+            yield None, final_metadata
+        except Exception as e:
+            self.logger.error(f"Failed to generate streaming answer from prepared context: {e}")
+            import traceback
+            full_error = traceback.format_exc()
+            self.logger.error(f"Full error traceback:\n{full_error}")
+            yield f"Error generating answer: {str(e)}", {"error": full_error, "complete": True}
 
     def _stream_with_summary_filter(self, prompt: str):
         """

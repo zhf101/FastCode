@@ -77,12 +77,9 @@ def _repo_name_from_source(source: str, is_url: bool) -> str:
 
 
 def _is_repo_indexed(repo_name: str) -> bool:
-    """Check whether a repo already has a persisted FAISS index."""
+    """Check whether a repo has graph-first indexed artifacts available."""
     fc = _get_fastcode()
-    persist_dir = fc.vector_store.persist_dir
-    faiss_path = os.path.join(persist_dir, f"{repo_name}.faiss")
-    meta_path = os.path.join(persist_dir, f"{repo_name}_metadata.pkl")
-    return os.path.exists(faiss_path) and os.path.exists(meta_path)
+    return fc.is_repository_indexed(repo_name)
 
 
 def _apply_forced_env_excludes(fc) -> None:
@@ -445,26 +442,12 @@ def search_symbol(
     if not _ensure_loaded(fc, ready_names):
         return "Error: Failed to load repository indexes."
 
-    query_lower = symbol_name.lower()
-    exact, prefix, contains = [], [], []
-
-    for meta in fc.vector_store.metadata:
-        name = meta.get("name", "")
-        elem_type = meta.get("type", "")
-        if elem_type == "repository_overview":
-            continue
-        if symbol_type and elem_type != symbol_type:
-            continue
-
-        name_lower = name.lower()
-        if name_lower == query_lower:
-            exact.append(meta)
-        elif name_lower.startswith(query_lower):
-            prefix.append(meta)
-        elif query_lower in name_lower:
-            contains.append(meta)
-
-    ranked = (exact + prefix + contains)[:20]
+    ranked = fc.search_indexed_symbols(
+        symbol_name,
+        repo_names=ready_names,
+        symbol_type=symbol_type,
+        limit=20,
+    )
     if not ranked:
         return f"No symbols matching '{symbol_name}' found."
 
@@ -504,15 +487,13 @@ def get_repo_structure(repo_name: str) -> str:
     if not _is_repo_indexed(repo_name):
         return f"Repository '{repo_name}' is not indexed. Use code_qa or reindex_repo first."
 
-    overviews = fc.vector_store.load_repo_overviews()
-    overview = overviews.get(repo_name)
+    overview = fc.get_repository_overview(repo_name)
     if not overview:
         return f"No overview found for repository '{repo_name}'. It may need re-indexing."
 
-    metadata = overview.get("metadata", {})
-    summary = metadata.get("summary", "No summary available.")
-    structure_text = metadata.get("structure_text", "")
-    file_structure = metadata.get("file_structure", {})
+    summary = overview.get("summary", "No summary available.")
+    structure_text = overview.get("structure_text", "")
+    file_structure = overview.get("file_structure", {})
     languages = file_structure.get("languages", {})
 
     parts = [f"Repository: {repo_name}", ""]
@@ -548,56 +529,40 @@ def get_file_summary(file_path: str, repos: list[str]) -> str:
     if not _ensure_loaded(fc, ready_names):
         return "Error: Failed to load repository indexes."
 
-    # Find matching elements by relative_path
-    matching = []
-    for meta in fc.vector_store.metadata:
-        rel = meta.get("relative_path", "")
-        if meta.get("type") == "repository_overview":
-            continue
-        if rel.endswith(file_path) or file_path in rel:
-            matching.append(meta)
-
-    if not matching:
+    outline = fc.get_file_outline(file_path, repo_names=ready_names)
+    if not outline:
         return f"No elements found for file path '{file_path}'."
 
-    files = [m for m in matching if m.get("type") == "file"]
-    classes = [m for m in matching if m.get("type") == "class"]
-    functions = [m for m in matching if m.get("type") == "function"]
-
-    file_meta = files[0] if files else matching[0]
-    actual_path = file_meta.get("relative_path", file_path)
-    repo = file_meta.get("repo_name", "")
+    actual_path = outline.get("relative_path", file_path)
+    repo = outline.get("repo_name", "")
+    classes = outline.get("classes", [])
+    functions = outline.get("functions", [])
+    top_level = [f for f in functions if not f.get("class_name")]
 
     parts = [f"File: {repo}/{actual_path}" if repo else f"File: {actual_path}"]
-
-    if files:
-        fm = files[0]
-        parts.append(f"Language: {fm.get('language', '?')}")
-        mi = fm.get("metadata", {})
-        parts.append(f"Lines: {mi.get('total_lines', '?')} (code: {mi.get('code_lines', '?')})")
-        num_imports = mi.get("num_imports", 0)
-        if num_imports:
-            parts.append(f"Imports: {num_imports}")
+    parts.append(f"Language: {outline.get('language', '?')}")
+    parts.append(
+        f"Lines: {outline.get('total_lines', '?')} (code: {outline.get('code_lines', '?')})"
+    )
+    num_imports = outline.get("num_imports", 0)
+    if num_imports:
+        parts.append(f"Imports: {num_imports}")
 
     if classes:
         parts.append(f"\nClasses ({len(classes)}):")
         for c in classes:
             sig = c.get("signature", c.get("name", ""))
-            mi = c.get("metadata", {})
-            methods = mi.get("methods", [])
             loc = f"L{c.get('start_line', '')}-L{c.get('end_line', '')}"
             parts.append(f"  - {sig} ({loc})")
-            for m in methods:
-                parts.append(f"      .{m}")
+            for method_name in c.get("methods", []):
+                parts.append(f"      .{method_name}")
 
-    if functions:
-        top_level = [f for f in functions if not f.get("metadata", {}).get("class_name")]
-        if top_level:
-            parts.append(f"\nFunctions ({len(top_level)}):")
-            for fn in top_level:
-                sig = fn.get("signature", fn.get("name", ""))
-                loc = f"L{fn.get('start_line', '')}-L{fn.get('end_line', '')}"
-                parts.append(f"  - {sig} ({loc})")
+    if top_level:
+        parts.append(f"\nFunctions ({len(top_level)}):")
+        for fn in top_level:
+            sig = fn.get("signature", fn.get("name", ""))
+            loc = f"L{fn.get('start_line', '')}-L{fn.get('end_line', '')}"
+            parts.append(f"  - {sig} ({loc})")
 
     return "\n".join(parts)
 

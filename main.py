@@ -455,29 +455,11 @@ def remove_repo(repo_name, config, confirm, keep_source):
     """Remove a repository and all its data (index, BM25, graphs, overview, source)"""
 
     fastcode = FastCode(config_path=config)
-    persist_dir = fastcode.vector_store.persist_dir
-    repo_root = fastcode.config.get("repo_root", "./repos")
+    artifact_status = fastcode.get_repository_artifact_status(repo_name)
+    existing_files = artifact_status["index_files"]
+    has_source = artifact_status["has_source"]
 
-    # Check if any data exists for this repository
-    file_patterns = [
-        f"{repo_name}.faiss",
-        f"{repo_name}_metadata.pkl",
-        f"{repo_name}_bm25.pkl",
-        f"{repo_name}_graphs.pkl",
-    ]
-    existing_files = []
-    total_size = 0
-    for fname in file_patterns:
-        fpath = os.path.join(persist_dir, fname)
-        if os.path.exists(fpath):
-            size = os.path.getsize(fpath)
-            existing_files.append((fname, size))
-            total_size += size
-
-    repo_dir = os.path.join(repo_root, repo_name)
-    has_source = os.path.isdir(repo_dir)
-
-    if not existing_files and not has_source:
+    if not existing_files and not artifact_status["has_overview"] and not has_source:
         click.echo(f"Error: Repository '{repo_name}' not found", err=True)
         sys.exit(1)
 
@@ -485,18 +467,16 @@ def remove_repo(repo_name, config, confirm, keep_source):
     if not confirm:
         click.echo(f"Repository: {repo_name}")
         click.echo(f"\nData to be deleted:")
-        for fname, size in existing_files:
-            click.echo(f"  - {fname} ({size / (1024*1024):.2f} MB)")
+        for artifact in existing_files:
+            click.echo(f"  - {artifact['name']} ({artifact['size_mb']:.2f} MB)")
 
-        # Check overview
-        overviews = fastcode.vector_store.load_repo_overviews()
-        if repo_name in overviews:
+        if artifact_status["has_overview"]:
             click.echo(f"  - repo_overviews.pkl (entry for {repo_name})")
 
         if has_source and not keep_source:
             click.echo(f"  - repos/{repo_name}/ (source code)")
 
-        click.echo(f"\nTotal index size: {total_size / (1024*1024):.2f} MB")
+        click.echo(f"\nTotal index size: {artifact_status['total_index_mb']:.2f} MB")
 
         if not click.confirm("\nAre you sure you want to remove this repository?"):
             click.echo("Cancelled.")
@@ -520,63 +500,32 @@ def clean_indices(config):
     """Clean up orphaned index files"""
     
     fastcode = FastCode(config_path=config)
-    # fastcode = FastCode()
-    persist_dir = fastcode.vector_store.persist_dir
-    
-    if not os.path.exists(persist_dir):
+    scan_result = fastcode.find_orphaned_index_files()
+
+    if not os.path.exists(scan_result["persist_dir"]):
         click.echo("No vector store directory found")
         return
-    
-    # Find all .faiss files
-    faiss_files = [f for f in os.listdir(persist_dir) if f.endswith('.faiss')]
-    
-    orphaned = []
-    valid = []
-    
-    for faiss_file in faiss_files:
-        repo_name = faiss_file.replace('.faiss', '')
-        metadata_file = f"{repo_name}_metadata.pkl"
-        
-        if metadata_file not in os.listdir(persist_dir):
-            orphaned.append(faiss_file)
-        else:
-            valid.append(repo_name)
-    
-    # Find orphaned metadata files
-    metadata_files = [f for f in os.listdir(persist_dir) if f.endswith('_metadata.pkl')]
-    
-    for metadata_file in metadata_files:
-        repo_name = metadata_file.replace('_metadata.pkl', '')
-        faiss_file = f"{repo_name}.faiss"
-        
-        if faiss_file not in os.listdir(persist_dir):
-            if metadata_file not in orphaned:
-                orphaned.append(metadata_file)
-    
+
+    orphaned = scan_result["orphaned_files"]
+    valid = scan_result["valid_repositories"]
+
     if not orphaned:
         click.echo("✓ No orphaned files found")
         click.echo(f"  {len(valid)} valid repositories in index")
         return
     
     click.echo(f"Found {len(orphaned)} orphaned file(s):")
-    total_size = 0
-    for file in orphaned:
-        file_path = os.path.join(persist_dir, file)
-        size = os.path.getsize(file_path) / (1024 * 1024)
-        total_size += size
-        click.echo(f"  - {file} ({size:.2f} MB)")
+    for artifact in orphaned:
+        click.echo(f"  - {artifact['name']} ({artifact['size_mb']:.2f} MB)")
     
-    click.echo(f"\nTotal size: {total_size:.2f} MB")
+    click.echo(f"\nTotal size: {scan_result['total_size_mb']:.2f} MB")
     
     if click.confirm("\nRemove these orphaned files?"):
-        for file in orphaned:
-            try:
-                os.remove(os.path.join(persist_dir, file))
-                click.echo(f"  ✓ Removed {file}")
-            except Exception as e:
-                click.echo(f"  ✗ Failed to remove {file}: {e}")
-        
-        click.echo(f"\n✓ Cleanup complete. Freed {total_size:.2f} MB")
+        result = fastcode.remove_orphaned_index_files()
+        for file_name in result["removed_files"]:
+            click.echo(f"  ✓ Removed {file_name}")
+
+        click.echo(f"\n✓ Cleanup complete. Freed {result['freed_mb']:.2f} MB")
     else:
         click.echo("Cancelled.")
 
