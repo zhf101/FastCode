@@ -15,6 +15,17 @@ if platform.system() == 'Darwin':
 __version__ = "2.0.0"
 
 from .app.graph_first_facade import GraphFirstFacade
+FastCode = GraphFirstFacade
+
+
+class _LazyLegacyFastCodeMeta(type):
+    def __call__(cls, *args, **kwargs):
+        from .main import FastCode as _LegacyFastCode
+
+        return _LegacyFastCode(*args, **kwargs)
+
+
+LegacyFastCode = _LazyLegacyFastCodeMeta("FastCode", (), {"__module__": "fastcode.main"})
 
 
 def _load_legacy():
@@ -37,11 +48,10 @@ def _load_legacy():
 
 
 def __getattr__(name: str):
-    if name == "GraphFirstFacade":
+    if name in {"GraphFirstFacade", "FastCode"}:
         return GraphFirstFacade
 
     legacy_names = {
-        "FastCode": 0,
         "RepositoryLoader": 1,
         "CodeParser": 2,
         "CodeIndexer": 3,
@@ -59,6 +69,7 @@ def __getattr__(name: str):
 
 __all__ = [
     "FastCode",
+    "LegacyFastCode",
     "GraphFirstFacade",
     "RepositoryLoader",
     "CodeParser",
