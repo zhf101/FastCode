@@ -6,7 +6,7 @@ Use only when graph context is insufficient for implementation-level questions.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,7 @@ class RetrievalResult:
     error: str | None = None
     available: bool = True
     unavailable_reason: str | None = None
+    backend_metadata: dict[str, Any] | None = None
 
     @property
     def found(self) -> bool:
@@ -110,25 +111,114 @@ class CodeRetriever:
                 query=query,
                 available=self._available,
                 unavailable_reason=self._unavailable_reason,
+                backend_metadata=None,
             )
 
         try:
-            raw = self._backend.retrieve(query, top_k=max_results)
-            snippets = [
-                CodeSnippet(
-                    file_path=item.get("file_path", ""),
-                    content=item.get("content", ""),
-                    score=float(item.get("score", 0.0)),
-                    line_start=item.get("line_start"),
-                    line_end=item.get("line_end"),
-                    symbol_name=item.get("name"),
-                )
-                for item in (raw or [])
-            ]
-            return RetrievalResult(query=query, snippets=snippets, available=True)
+            raw = self._call_backend_retrieve(query, max_results=max_results)
+            snippets = self._map_raw_results(raw, max_results=max_results)
+            return RetrievalResult(
+                query=query,
+                snippets=snippets,
+                available=True,
+                backend_metadata=self._backend_metadata(),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("CodeRetriever.retrieve failed: %s", exc)
-            return RetrievalResult(query=query, error=str(exc), available=True)
+            return RetrievalResult(
+                query=query,
+                error=str(exc),
+                available=True,
+                backend_metadata=self._backend_metadata(),
+            )
+
+    def _call_backend_retrieve(self, query: str, *, max_results: int):
+        """Call backend.retrieve with a signature compatible with known backends."""
+        try:
+            return self._backend.retrieve(query, top_k=max_results)
+        except TypeError:
+            return self._backend.retrieve(query)
+
+    def _map_raw_results(self, raw: Any, *, max_results: int) -> list[CodeSnippet]:
+        """Normalize backend-specific result payloads into CodeSnippet objects."""
+        items = list(raw or [])
+        snippets: list[CodeSnippet] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            snippet = self._snippet_from_backend_item(item)
+            if snippet is not None:
+                snippets.append(snippet)
+            if len(snippets) >= max_results:
+                break
+        return snippets
+
+    def _snippet_from_backend_item(self, item: dict[str, Any]) -> CodeSnippet | None:
+        """Map either snippet-style or legacy HybridRetriever-style items."""
+        if "element" in item and isinstance(item["element"], dict):
+            return self._snippet_from_legacy_hybrid_item(item)
+        return self._snippet_from_plain_item(item)
+
+    @staticmethod
+    def _snippet_from_plain_item(item: dict[str, Any]) -> CodeSnippet:
+        return CodeSnippet(
+            file_path=item.get("file_path", ""),
+            content=item.get("content", ""),
+            score=float(item.get("score", 0.0)),
+            line_start=item.get("line_start"),
+            line_end=item.get("line_end"),
+            symbol_name=item.get("name"),
+        )
+
+    @staticmethod
+    def _snippet_from_legacy_hybrid_item(item: dict[str, Any]) -> CodeSnippet | None:
+        element = item.get("element")
+        if not isinstance(element, dict):
+            return None
+
+        line_start = element.get("start_line")
+        line_end = element.get("end_line")
+        if line_start is None and isinstance(element.get("line_range"), (list, tuple)) and len(element["line_range"]) == 2:
+            line_start, line_end = element["line_range"]
+
+        content = (
+            element.get("code")
+            or element.get("content")
+            or element.get("summary")
+            or ""
+        )
+
+        return CodeSnippet(
+            file_path=element.get("file_path") or element.get("relative_path", ""),
+            content=content,
+            score=float(item.get("total_score", item.get("score", 0.0))),
+            line_start=line_start,
+            line_end=line_end,
+            symbol_name=element.get("name"),
+            node_id=element.get("id"),
+        )
+
+    def _backend_metadata(self) -> dict[str, Any] | None:
+        """Extract lightweight metadata from the wrapped backend if available."""
+        if self._backend is None:
+            return None
+
+        metadata: dict[str, Any] = {}
+        reload_result = getattr(self._backend, "last_reload_result", None)
+        serialized_reload = self._serialize_backend_value(reload_result)
+        if serialized_reload is not None:
+            metadata["last_reload_result"] = serialized_reload
+        return metadata or None
+
+    @staticmethod
+    def _serialize_backend_value(value: Any) -> Any:
+        if value is None:
+            return None
+        if is_dataclass(value):
+            return asdict(value)
+        if isinstance(value, dict):
+            return dict(value)
+        return value
 
     def is_available(self) -> bool:
         """Return whether a real retrieval backend is available."""

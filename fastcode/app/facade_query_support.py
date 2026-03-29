@@ -252,6 +252,7 @@ class GraphFirstQuerySupportMixin:
                 "searched_repositories": result.get("searched_repositories", []),
                 "retrieval_available": result.get("retrieval_available"),
                 "retrieval_unavailable_reason": result.get("retrieval_unavailable_reason"),
+                "retrieval_backend_metadata": result.get("retrieval_backend_metadata"),
             }
         except Exception as exc:
             yield None, {"error": str(exc)}
@@ -329,6 +330,7 @@ class GraphFirstQuerySupportMixin:
                 "restricted_mode": result.get("restricted_mode", False),
                 "retrieval_available": result.get("retrieval_available"),
                 "retrieval_unavailable_reason": result.get("retrieval_unavailable_reason"),
+                "retrieval_backend_metadata": result.get("retrieval_backend_metadata"),
             }
         except Exception as exc:
             yield None, {"error": str(exc)}

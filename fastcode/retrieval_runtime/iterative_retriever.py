@@ -21,6 +21,7 @@ class IterativeRetrievalResult:
     error: str | None = None
     available: bool = True
     unavailable_reason: str | None = None
+    backend_metadata: dict[str, object] | None = None
 
     @property
     def found(self) -> bool:
@@ -54,11 +55,13 @@ class IterativeRetriever:
         rounds = 0
 
         current_query = query
+        backend_metadata: dict[str, object] | None = None
         for _ in range(self._max_rounds):
             rounds += 1
             result: RetrievalResult = self._retriever.retrieve(
                 current_query, max_results=max_results,
             )
+            backend_metadata = result.backend_metadata
             if result.unavailable:
                 logger.warning(
                     "IterativeRetriever: round %d unavailable: %s",
@@ -71,6 +74,7 @@ class IterativeRetriever:
                     snippets=all_snippets,
                     available=False,
                     unavailable_reason=result.unavailable_reason,
+                    backend_metadata=backend_metadata,
                 )
             if result.error:
                 logger.warning("IterativeRetriever: round %d error: %s", rounds, result.error)
@@ -95,4 +99,5 @@ class IterativeRetriever:
             rounds=rounds,
             snippets=all_snippets,
             available=True,
+            backend_metadata=backend_metadata,
         )

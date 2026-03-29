@@ -25,6 +25,7 @@ class AugmentationResult:
     error: str | None = None
     retrieval_available: bool | None = None
     retrieval_unavailable_reason: str | None = None
+    backend_metadata: dict[str, object] | None = None
 
     @property
     def has_content(self) -> bool:
@@ -72,6 +73,7 @@ class GraphAugmentedRetriever:
                 error=result.unavailable_reason or "retrieval unavailable",
                 retrieval_available=False,
                 retrieval_unavailable_reason=result.unavailable_reason or "retrieval unavailable",
+                backend_metadata=result.backend_metadata,
             )
 
         if result.error:
@@ -80,6 +82,7 @@ class GraphAugmentedRetriever:
                 reason=reason,
                 error=result.error,
                 retrieval_available=True,
+                backend_metadata=result.backend_metadata,
             )
 
         # Link snippets to graph nodes by file_path match
@@ -97,6 +100,7 @@ class GraphAugmentedRetriever:
             snippets=result.snippets,
             reason=reason,
             retrieval_available=True,
+            backend_metadata=result.backend_metadata,
         )
 
     def _should_augment(self, ctx: QueryContext) -> tuple[bool, str]:

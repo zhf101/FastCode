@@ -116,4 +116,5 @@ class GraphFirstRouterSupportMixin:
             "intent_confidence": result.classification.confidence,
             "retrieval_available": result.retrieval_available,
             "retrieval_unavailable_reason": result.retrieval_unavailable_reason,
+            "retrieval_backend_metadata": result.retrieval_backend_metadata,
         }

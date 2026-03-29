@@ -6,7 +6,7 @@ Enhanced with LLM-processed query support
 import os
 import pickle
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Dict, Any, Set, Tuple, Optional, Union
 import numpy as np
 from rank_bm25 import BM25Okapi
@@ -29,6 +29,41 @@ class ActiveRetrievalState:
     bm25_index: Optional[BM25Okapi]
     elements: List[CodeElement]
     is_filtered: bool
+
+
+@dataclass
+class RepoScopeState:
+    """Tracks which repository scope is currently loaded into filtered indexes."""
+
+    current_loaded_repos: Optional[List[str]] = field(default=None)
+
+    def matches(self, repo_filter: Optional[List[str]]) -> bool:
+        return self.current_loaded_repos == repo_filter
+
+    def mark_loaded(self, repo_names: List[str]) -> None:
+        self.current_loaded_repos = list(repo_names)
+
+    def clear(self) -> None:
+        self.current_loaded_repos = None
+
+
+@dataclass
+class ReloadRepositoriesResult:
+    """Structured result for filtered repository reload operations."""
+
+    requested_repos: List[str]
+    loaded_repo_count: int
+    vector_count: int
+    bm25_element_count: int
+    failed_repos: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+
+    @property
+    def success(self) -> bool:
+        return self.loaded_repo_count > 0 and self.error is None
+
+    def __bool__(self) -> bool:
+        return self.success
 
 
 class HybridRetriever:
@@ -103,7 +138,20 @@ class HybridRetriever:
         ensure_dir(self.persist_dir)
         
         # Track currently loaded repositories for filtering
-        self.current_loaded_repos = None  # None means all repos loaded, List means specific repos
+        self._repo_scope_state = RepoScopeState()
+        self.last_reload_result: Optional[Dict[str, Any]] = None
+
+    @property
+    def current_loaded_repos(self) -> Optional[List[str]]:
+        """Compatibility view of the currently loaded repository scope."""
+        return self._repo_scope_state.current_loaded_repos
+
+    @current_loaded_repos.setter
+    def current_loaded_repos(self, value: Optional[List[str]]) -> None:
+        if value is None:
+            self._repo_scope_state.clear()
+            return
+        self._repo_scope_state.mark_loaded(value)
     
     def index_for_bm25(self, elements: List[CodeElement]):
         """
@@ -404,18 +452,18 @@ class HybridRetriever:
             return
 
         self.logger.info(f"Filtering by repositories: {repo_filter}")
-        if self.current_loaded_repos == repo_filter:
+        if self._repo_scope_state.matches(repo_filter):
             return
 
         self.logger.info(f"Reloading specific repository indexes for {reason}")
         if self.reload_specific_repositories(repo_filter):
-            self.current_loaded_repos = repo_filter
+            self._repo_scope_state.mark_loaded(repo_filter)
             return
 
         if warn_on_failure:
             self.logger.warning("Failed to reload specific repositories, using filtered search")
         if clear_on_failure:
-            self.current_loaded_repos = None
+            self._repo_scope_state.clear()
 
     def _apply_retrieval_enhancements(
         self,
@@ -1306,7 +1354,7 @@ class HybridRetriever:
         
         return results
     
-    def reload_specific_repositories(self, repo_names: List[str]) -> bool:
+    def reload_specific_repositories(self, repo_names: List[str]) -> ReloadRepositoriesResult:
         """
         Reload specific repository indexes for accurate retrieval
         Populates FILTERED indexes while keeping FULL indexes intact
@@ -1315,34 +1363,75 @@ class HybridRetriever:
             repo_names: List of repository names to reload
         
         Returns:
-            True if successful, False otherwise
+            Structured reload result. Truthiness preserves legacy bool semantics.
         """
         self.logger.info(f"Reloading specific repositories into filtered indexes: {repo_names}")
         
         try:
-            loaded_count = self._reload_filtered_vector_store(repo_names)
+            loaded_count, failed_repos = self._reload_filtered_vector_store(repo_names)
             
             if loaded_count == 0:
                 self.logger.error("Failed to load any repository vector indexes")
-                return False
+                result = ReloadRepositoriesResult(
+                    requested_repos=list(repo_names),
+                    loaded_repo_count=0,
+                    vector_count=0,
+                    bm25_element_count=0,
+                    failed_repos=failed_repos or list(repo_names),
+                    error="Failed to load any repository vector indexes",
+                )
+                self.last_reload_result = self._serialize_reload_result(result)
+                return result
             
             self._reload_filtered_bm25_indexes(repo_names)
             self._sync_iterative_agent_state()
+            vector_count = self.filtered_vector_store.get_count() if self.filtered_vector_store is not None else 0
+            bm25_element_count = len(self.filtered_bm25_elements)
             
             self.logger.info(
                 f"Successfully reloaded {loaded_count} repositories with "
-                f"{self.filtered_vector_store.get_count()} vectors and "
-                f"{len(self.filtered_bm25_elements)} BM25 elements"
+                f"{vector_count} vectors and "
+                f"{bm25_element_count} BM25 elements"
             )
-            return True
+            result = ReloadRepositoriesResult(
+                requested_repos=list(repo_names),
+                loaded_repo_count=loaded_count,
+                vector_count=vector_count,
+                bm25_element_count=bm25_element_count,
+                failed_repos=failed_repos,
+            )
+            self.last_reload_result = self._serialize_reload_result(result)
+            return result
             
         except Exception as e:
             self.logger.error(f"Failed to reload specific repositories: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
-            return False
+            result = ReloadRepositoriesResult(
+                requested_repos=list(repo_names),
+                loaded_repo_count=0,
+                vector_count=0,
+                bm25_element_count=0,
+                failed_repos=list(repo_names),
+                error=str(e),
+            )
+            self.last_reload_result = self._serialize_reload_result(result)
+            return result
 
-    def _reload_filtered_vector_store(self, repo_names: List[str]) -> int:
+    @staticmethod
+    def _serialize_reload_result(result: ReloadRepositoriesResult) -> Dict[str, Any]:
+        """Serialize reload results into a lightweight metadata dict."""
+        return {
+            "requested_repos": list(result.requested_repos),
+            "loaded_repo_count": result.loaded_repo_count,
+            "vector_count": result.vector_count,
+            "bm25_element_count": result.bm25_element_count,
+            "failed_repos": list(result.failed_repos),
+            "error": result.error,
+            "success": result.success,
+        }
+
+    def _reload_filtered_vector_store(self, repo_names: List[str]) -> Tuple[int, List[str]]:
         """Reload filtered vector store from repository-specific persisted indexes."""
         if self.filtered_vector_store is None:
             self.filtered_vector_store = VectorStore(self.config)
@@ -1351,6 +1440,7 @@ class HybridRetriever:
             self.filtered_vector_store.clear()
 
         loaded_count = 0
+        failed_repos: List[str] = []
         for repo_name in repo_names:
             self.logger.info(f"Loading vector index for {repo_name}...")
             if self.filtered_vector_store.merge_from_index(repo_name):
@@ -1358,7 +1448,8 @@ class HybridRetriever:
                 loaded_count += 1
             else:
                 self.logger.warning(f"Failed to load vector index for {repo_name}")
-        return loaded_count
+                failed_repos.append(repo_name)
+        return loaded_count, failed_repos
 
     def _reload_filtered_bm25_indexes(self, repo_names: List[str]) -> None:
         """Reload filtered BM25 corpus and elements for the selected repositories."""

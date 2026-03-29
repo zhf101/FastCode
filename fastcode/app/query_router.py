@@ -27,6 +27,7 @@ class RouteResult:
     sources: list[dict[str, object]]
     retrieval_available: bool | None = None
     retrieval_unavailable_reason: str | None = None
+    retrieval_backend_metadata: dict[str, object] | None = None
 
 
 _EMPTY_META = ProjectMeta(name="unknown", languages=[], frameworks=[], description="")
@@ -87,6 +88,7 @@ class QueryRouter:
                 sources=[],
                 retrieval_available=None,
                 retrieval_unavailable_reason=None,
+                retrieval_backend_metadata=None,
             )
 
         # 3. Load graph + dispatch
@@ -101,11 +103,12 @@ class QueryRouter:
             answer, sources = self._handle_onboard(query, graph)
             retrieval_available = None
             retrieval_unavailable_reason = None
+            retrieval_backend_metadata = None
         else:
             # graph_qa / hybrid_detail / unknown — use general context + augmentation
             ctx = container.context_builder.build(graph, query)
             answer = self._answering.answer(query, ctx, restricted=False)
-            answer, retrieval_available, retrieval_unavailable_reason = self._augment_answer(
+            answer, retrieval_available, retrieval_unavailable_reason, retrieval_backend_metadata = self._augment_answer(
                 query,
                 ctx,
                 answer,
@@ -115,6 +118,7 @@ class QueryRouter:
         if intent in {QueryIntent.explain, QueryIntent.diff}:
             retrieval_available = None
             retrieval_unavailable_reason = None
+            retrieval_backend_metadata = None
 
         return RouteResult(
             answer=answer, classification=classification,
@@ -122,6 +126,7 @@ class QueryRouter:
             sources=sources,
             retrieval_available=retrieval_available,
             retrieval_unavailable_reason=retrieval_unavailable_reason,
+            retrieval_backend_metadata=retrieval_backend_metadata,
         )
 
     # ------------------------------------------------------------------
@@ -135,14 +140,14 @@ class QueryRouter:
         answer: AnswerResult,
         *,
         use_agency_mode: bool,
-    ) -> tuple[AnswerResult, bool | None, str | None]:
-        snippets, retrieval_available, retrieval_unavailable_reason = (
+    ) -> tuple[AnswerResult, bool | None, str | None, dict[str, object] | None]:
+        snippets, retrieval_available, retrieval_unavailable_reason, retrieval_backend_metadata = (
             self._agency_augmentation_snippets(query)
             if use_agency_mode
             else self._graph_gap_snippets(query, ctx)
         )
         if not snippets:
-            return answer, retrieval_available, retrieval_unavailable_reason
+            return answer, retrieval_available, retrieval_unavailable_reason, retrieval_backend_metadata
 
         packed = self._packer.pack(ctx, snippets)
         augmented_text = answer.answer + "\n\n" + packed.text
@@ -156,30 +161,32 @@ class QueryRouter:
             ),
             retrieval_available,
             retrieval_unavailable_reason,
+            retrieval_backend_metadata,
         )
 
     def _graph_gap_snippets(
         self,
         query: str,
         ctx: QueryContext,
-    ) -> tuple[list[CodeSnippet], bool | None, str | None]:
+    ) -> tuple[list[CodeSnippet], bool | None, str | None, dict[str, object] | None]:
         """Return graph-gap snippets when normal augmentation decides they are needed."""
         aug = self._augmenter.augment_from_graph_gap(query, ctx)
         if not aug.triggered or not aug.has_content:
-            return [], aug.retrieval_available, aug.retrieval_unavailable_reason
-        return aug.snippets, aug.retrieval_available, aug.retrieval_unavailable_reason
+            return [], aug.retrieval_available, aug.retrieval_unavailable_reason, aug.backend_metadata
+        return aug.snippets, aug.retrieval_available, aug.retrieval_unavailable_reason, aug.backend_metadata
 
     def _agency_augmentation_snippets(
         self,
         query: str,
-    ) -> tuple[list[CodeSnippet], bool | None, str | None]:
+    ) -> tuple[list[CodeSnippet], bool | None, str | None, dict[str, object] | None]:
         """Return iterative retrieval snippets for agency-compatible mode."""
         aug = self._iterative.retrieve(query, max_results=10)
         available = getattr(aug, "available", True)
         unavailable_reason = getattr(aug, "unavailable_reason", None)
+        backend_metadata = getattr(aug, "backend_metadata", None)
         if aug.error or not aug.snippets:
-            return [], available, unavailable_reason
-        return aug.snippets, available, unavailable_reason
+            return [], available, unavailable_reason, backend_metadata
+        return aug.snippets, available, unavailable_reason, backend_metadata
 
     def _handle_explain(self, query: str, graph) -> tuple[AnswerResult, list[dict[str, object]]]:
         from fastcode.graph_services.explain_service import (

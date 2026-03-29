@@ -59,6 +59,7 @@ class QueryResponse(BaseModel):
     session_id: Optional[str] = None
     retrieval_available: Optional[bool] = None
     retrieval_unavailable_reason: Optional[str] = None
+    retrieval_backend_metadata: Optional[Dict[str, Any]] = None
 
 
 class LoadRepositoriesRequest(BaseModel):
@@ -493,6 +494,7 @@ async def query_repository(request: QueryRequest):
             session_id=session_id,
             retrieval_available=result.get("retrieval_available"),
             retrieval_unavailable_reason=result.get("retrieval_unavailable_reason"),
+            retrieval_backend_metadata=_safe_jsonable(result.get("retrieval_backend_metadata")),
         )
 
     except Exception as e:
@@ -549,6 +551,7 @@ async def query_repository_stream(request: QueryRequest):
                             "session_id": session_id,
                             "retrieval_available": metadata.get("retrieval_available"),
                             "retrieval_unavailable_reason": metadata.get("retrieval_unavailable_reason"),
+                            "retrieval_backend_metadata": _safe_jsonable(metadata.get("retrieval_backend_metadata")),
                         }
                     elif "error" in metadata:
                         event_data = {"type": "error", "error": metadata["error"]}

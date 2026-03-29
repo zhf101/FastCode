@@ -48,6 +48,28 @@ class GraphFirstAnswerFormatter:
                     f"{index}. {repository_prefix}**{name}** ({source_type}){location}{score_text}"
                 )
 
+        if result.get("retrieval_available") is False:
+            reason = result.get("retrieval_unavailable_reason") or "retrieval unavailable"
+            output.append(f"\n\n## Retrieval Status\nUnavailable: {reason}")
+
+        backend_meta = result.get("retrieval_backend_metadata") or {}
+        if isinstance(backend_meta, dict):
+            last_reload = backend_meta.get("last_reload_result")
+            if isinstance(last_reload, dict):
+                requested = last_reload.get("requested_repos", [])
+                loaded = last_reload.get("loaded_repo_count", 0)
+                vector_count = last_reload.get("vector_count", 0)
+                bm25_count = last_reload.get("bm25_element_count", 0)
+                failed = last_reload.get("failed_repos", [])
+
+                output.append(
+                    "\n\n## Retrieval Scope\n"
+                    f"Loaded repos: {loaded}/{len(requested)} | "
+                    f"Vectors: {vector_count} | BM25 elements: {bm25_count}"
+                )
+                if failed:
+                    output.append("Failed repos: " + ", ".join(str(repo) for repo in failed))
+
         if "prompt_tokens" in result:
             output.append(
                 f"\n\n*Used {result['prompt_tokens']} prompt tokens, "

@@ -286,6 +286,20 @@ def code_qa(
         reason = result.get("retrieval_unavailable_reason") or "retrieval unavailable"
         parts.append(f"\n\n[retrieval_status: unavailable] {reason}")
 
+    backend_meta = result.get("retrieval_backend_metadata") or {}
+    last_reload = backend_meta.get("last_reload_result") if isinstance(backend_meta, dict) else None
+    if isinstance(last_reload, dict):
+        parts.append(
+            "\n[retrieval_scope_reload] "
+            f"loaded={last_reload.get('loaded_repo_count', 0)}/"
+            f"{len(last_reload.get('requested_repos', []))} "
+            f"vectors={last_reload.get('vector_count', 0)} "
+            f"bm25={last_reload.get('bm25_element_count', 0)}"
+        )
+        failed = last_reload.get("failed_repos") or []
+        if failed:
+            parts.append(f"[retrieval_scope_reload_failed] {', '.join(failed)}")
+
     parts.append(f"\n[session_id: {sid}]")
     return "\n".join(parts)
 
