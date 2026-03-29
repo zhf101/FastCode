@@ -6,6 +6,7 @@ Enhanced with LLM-processed query support
 import os
 import pickle
 import logging
+from dataclasses import dataclass
 from typing import List, Dict, Any, Set, Tuple, Optional, Union
 import numpy as np
 from rank_bm25 import BM25Okapi
@@ -18,6 +19,16 @@ from .query_processor import ProcessedQuery
 from .repo_selector import RepositorySelector
 from .utils import ensure_dir
 from .iterative_agent import IterativeAgent
+
+
+@dataclass
+class ActiveRetrievalState:
+    """Snapshot of the currently active retrieval indexes for the current repo scope."""
+
+    vector_store: Any
+    bm25_index: Optional[BM25Okapi]
+    elements: List[CodeElement]
+    is_filtered: bool
 
 
 class HybridRetriever:
@@ -481,61 +492,88 @@ class HybridRetriever:
             List of selected repository names
         """
         self.logger.info("Performing repository selection based on overviews (semantic + BM25)")
-        
-        # Prepare text for semantic search
-        if isinstance(query, list):
-            semantic_query_text = " ".join(query)
-        elif keywords:
-            semantic_query_text = " ".join(keywords)
-        else:
-            semantic_query_text = query
+        semantic_query_text = self._build_repo_selection_query_text(query, keywords)
+        semantic_results = self._semantic_repo_overview_results(semantic_query_text, top_k)
+        bm25_results = self._bm25_repo_overview_results(query, keywords, top_k)
+        repo_scores = self._combine_repository_selection_scores(semantic_results, bm25_results)
+        return self._select_top_repositories(repo_scores, top_k)
 
-        # Stage 1: Semantic search on repository overviews (use separate storage)
-        query_embedding = self.embedder.embed_text(semantic_query_text)
-        semantic_results = self.vector_store.search_repository_overviews(
+    @staticmethod
+    def _build_repo_selection_query_text(query: Union[str, List[str]], keywords: Optional[List[str]]) -> str:
+        """Build semantic repo-selection query text from keywords or original query."""
+        if isinstance(query, list):
+            return " ".join(query)
+        if keywords:
+            return " ".join(keywords)
+        return query
+
+    def _semantic_repo_overview_results(
+        self,
+        query_text: str,
+        top_k: int,
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        """Run semantic search over repository overviews."""
+        query_embedding = self.embedder.embed_text(query_text)
+        return self.vector_store.search_repository_overviews(
             query_embedding,
-            k=top_k * 2,  # Get more candidates for combining
-            min_score=self.min_repo_similarity
+            k=top_k * 2,
+            min_score=self.min_repo_similarity,
         )
-        
-        # Stage 2: BM25 search on repository overviews (use separate BM25 index)
-        bm25_results = []
-        if self.repo_overview_bm25 is not None and self.repo_overview_names:
-            # Tokenize using provided keywords when available; fall back to query text
-            query_tokens: List[str] = []
-            if keywords:
-                for kw in keywords:
-                    query_tokens.extend(kw.lower().split())
-            elif isinstance(query, list):
-                for part in query:
-                    query_tokens.extend(part.lower().split())
-            else:
-                query_tokens = query.lower().split()
-            scores = self.repo_overview_bm25.get_scores(query_tokens)
-            # Get repository overview results from separate index
-            for idx, score in enumerate(scores):
-                if idx < len(self.repo_overview_names) and score > 0:
-                    repo_name = self.repo_overview_names[idx]
-                    bm25_results.append((repo_name, float(score)))
-            
-            # Sort by BM25 score and take top candidates
-            bm25_results.sort(key=lambda x: x[1], reverse=True)
-            bm25_results = bm25_results[:top_k*2]
-        
-        # Stage 3: Combine scores from both methods
-        repo_scores = {}
-        
-        # Add semantic scores
+
+    def _bm25_repo_overview_results(
+        self,
+        query: Union[str, List[str]],
+        keywords: Optional[List[str]],
+        top_k: int,
+    ) -> List[Tuple[str, float]]:
+        """Run BM25 over repository overviews and return top candidates."""
+        if self.repo_overview_bm25 is None or not self.repo_overview_names:
+            return []
+
+        query_tokens = self._repo_selection_query_tokens(query, keywords)
+        scores = self.repo_overview_bm25.get_scores(query_tokens)
+        bm25_results: List[Tuple[str, float]] = []
+        for idx, score in enumerate(scores):
+            if idx < len(self.repo_overview_names) and score > 0:
+                repo_name = self.repo_overview_names[idx]
+                bm25_results.append((repo_name, float(score)))
+        bm25_results.sort(key=lambda x: x[1], reverse=True)
+        return bm25_results[:top_k * 2]
+
+    @staticmethod
+    def _repo_selection_query_tokens(
+        query: Union[str, List[str]],
+        keywords: Optional[List[str]],
+    ) -> List[str]:
+        """Tokenize query inputs for BM25 repository selection."""
+        query_tokens: List[str] = []
+        if keywords:
+            for kw in keywords:
+                query_tokens.extend(kw.lower().split())
+            return query_tokens
+        if isinstance(query, list):
+            for part in query:
+                query_tokens.extend(part.lower().split())
+            return query_tokens
+        return query.lower().split()
+
+    def _combine_repository_selection_scores(
+        self,
+        semantic_results: List[Tuple[Dict[str, Any], float]],
+        bm25_results: List[Tuple[str, float]],
+    ) -> Dict[str, Dict[str, float]]:
+        """Combine semantic and BM25 repo-selection scores with fixed weights."""
+        repo_scores: Dict[str, Dict[str, float]] = {}
+
         for metadata, score in semantic_results:
             repo_name = metadata.get("repo_name")
             if repo_name:
                 repo_scores[repo_name] = {
                     "semantic_score": score,
                     "bm25_score": 0.0,
-                    "total_score": score * 0.7  # 70% weight for semantic
+                    "total_score": score * 0.7,
                 }
-        
-        # Add BM25 scores (normalize them first)
+
         if bm25_results:
             max_bm25_score = max(score for _, score in bm25_results)
             if max_bm25_score > 0:
@@ -543,16 +581,23 @@ class HybridRetriever:
                     normalized_bm25 = score / max_bm25_score
                     if repo_name in repo_scores:
                         repo_scores[repo_name]["bm25_score"] = normalized_bm25
-                        repo_scores[repo_name]["total_score"] += normalized_bm25 * 0.3  # 30% weight for BM25
+                        repo_scores[repo_name]["total_score"] += normalized_bm25 * 0.3
                     else:
                         repo_scores[repo_name] = {
                             "semantic_score": 0.0,
                             "bm25_score": normalized_bm25,
-                            "total_score": normalized_bm25 * 0.3
+                            "total_score": normalized_bm25 * 0.3,
                         }
-        
-        
-        MIN_SCORE_THRESHOLD = 0.15
+
+        return repo_scores
+
+    def _select_top_repositories(
+        self,
+        repo_scores: Dict[str, Dict[str, float]],
+        top_k: int,
+    ) -> List[str]:
+        """Filter, log, and select the top repository candidates."""
+        min_score_threshold = 0.15
 
         for repo_name, scores in repo_scores.items():
             self.logger.info(
@@ -562,22 +607,20 @@ class HybridRetriever:
                 f"total: {scores['total_score']:.3f})"
             )
 
-        # 1. filter and sort
         qualified_repos = [
-            (name, scores) 
-            for name, scores in repo_scores.items() 
-            if scores["total_score"] > MIN_SCORE_THRESHOLD or scores["semantic_score"] > 0.4 or scores["bm25_score"] > 0.95
+            (name, scores)
+            for name, scores in repo_scores.items()
+            if scores["total_score"] > min_score_threshold
+            or scores["semantic_score"] > 0.4
+            or scores["bm25_score"] > 0.95
         ]
-        
         sorted_repos = sorted(
-            qualified_repos, 
-            key=lambda x: x[1]["total_score"], 
-            reverse=True
+            qualified_repos,
+            key=lambda x: x[1]["total_score"],
+            reverse=True,
         )
 
-        selected_repos = []
-        
-        # 2. get top k
+        selected_repos: List[str] = []
         for repo_name, scores in sorted_repos[:top_k]:
             selected_repos.append(repo_name)
             print(
@@ -586,11 +629,10 @@ class HybridRetriever:
                 f"bm25: {scores['bm25_score']:.3f}, "
                 f"total: {scores['total_score']:.3f})"
             )
-            
-        # 3. no repo selected
+
         if not selected_repos:
-            print(f"No repositories met the minimum score threshold of {MIN_SCORE_THRESHOLD}")
-        
+            print(f"No repositories met the minimum score threshold of {min_score_threshold}")
+
         return selected_repos
 
     def _select_relevant_repositories_by_llm(
@@ -618,40 +660,69 @@ class HybridRetriever:
         """
         self.logger.info("Performing LLM-based repository selection")
 
-        # Load overviews from storage
-        all_overviews = self.vector_store.load_repo_overviews()
-        if not all_overviews:
+        repo_overviews = self._scoped_repo_overviews_for_llm(scope_repos)
+        if repo_overviews is None:
             self.logger.warning("No repository overviews available for LLM selection")
             return []
 
-        # Narrow down to only the repos the caller cares about
+        if not repo_overviews:
+            self.logger.warning("No overviews remain after scoping, searching all scoped repos")
+            return scope_repos or []
+
+        selected = self._try_llm_repository_selection(query, repo_overviews, top_k)
+        if selected:
+            return selected
+        return self._fallback_repository_selection(query, top_k, scope_repos)
+
+    def _scoped_repo_overviews_for_llm(
+        self,
+        scope_repos: Optional[List[str]],
+    ) -> Optional[Dict[str, Any]]:
+        """Load repository overviews and optionally scope them for LLM selection."""
+        all_overviews = self.vector_store.load_repo_overviews()
+        if not all_overviews:
+            return None
+
         if scope_repos:
             repo_overviews = {k: v for k, v in all_overviews.items() if k in scope_repos}
             self.logger.info(
                 f"Scoped LLM repo selection to {len(repo_overviews)}/{len(all_overviews)} repos "
                 f"(scope_repos={scope_repos})"
             )
-        else:
-            repo_overviews = all_overviews
-            self.logger.info(f"LLM repo selection considering all {len(repo_overviews)} repos")
+            return repo_overviews
 
-        if not repo_overviews:
-            self.logger.warning("No overviews remain after scoping, searching all scoped repos")
-            return scope_repos or []
+        self.logger.info(f"LLM repo selection considering all {len(all_overviews)} repos")
+        return all_overviews
 
+    def _try_llm_repository_selection(
+        self,
+        query: str,
+        repo_overviews: Dict[str, Any],
+        top_k: int,
+    ) -> List[str]:
+        """Attempt LLM-based repo selection and return empty on failure."""
         try:
             selected = self.repo_selector.select_relevant_repos(
-                query, repo_overviews, max_repos=top_k
+                query,
+                repo_overviews,
+                max_repos=top_k,
             )
             if selected:
                 self.logger.info(f"LLM selected repos: {selected}")
                 return selected
-
             self.logger.warning("LLM returned no repos, falling back to embedding-based selection")
+            return []
         except Exception as e:
             self.logger.error(f"LLM repo selection failed: {e}, falling back to embedding-based selection")
+            return []
 
-        # Fallback 1: use the original embedding+BM25 method
+    def _fallback_repository_selection(
+        self,
+        query: str,
+        top_k: int,
+        scope_repos: Optional[List[str]],
+    ) -> List[str]:
+        """Fallback from LLM repo selection to embedding, then scoped repos, then empty."""
         try:
             embedding_selected = self._select_relevant_repositories(query, None, top_k)
             if embedding_selected:
@@ -661,12 +732,10 @@ class HybridRetriever:
         except Exception as e:
             self.logger.error(f"Embedding-based repo selection also failed: {e}")
 
-        # Fallback 2: return user's original scope_repos selection
         if scope_repos:
             self.logger.warning(f"All repo selection methods failed, falling back to user's original selection: {scope_repos}")
             return scope_repos
 
-        # Final fallback: return empty list (will search all repos)
         self.logger.warning("All repo selection methods failed and no scope_repos provided, will search all repos")
         return []
 
@@ -795,10 +864,7 @@ class HybridRetriever:
         """
         results = []
         
-        # Use filtered elements if available, otherwise use full elements
-        elements_to_search = (self.filtered_bm25_elements 
-                             if self.filtered_bm25_elements 
-                             else self.full_bm25_elements)
+        elements_to_search = self._active_elements()
         
         for file_info in selected_files:
             repo_name = file_info["repo_name"]
@@ -833,11 +899,9 @@ class HybridRetriever:
         # Embed query
         query_embedding = self.embedder.embed_text(query)
         
-        # Choose which vector store to use
-        if self.filtered_vector_store is not None and self.filtered_vector_store.get_count() > 0:
-            # Use filtered vector store
-            # IMPORTANT: Still pass repo_filter for double-checking, in case filtered store has stale data
-            results = self.filtered_vector_store.search(
+        vector_store, is_filtered = self._active_vector_store()
+        if is_filtered:
+            results = vector_store.search(
                 query_embedding,
                 k=top_k * 2,  # Get more candidates for filtering
                 min_score=self.min_similarity,
@@ -845,8 +909,7 @@ class HybridRetriever:
             )
             self.logger.debug(f"Semantic search (filtered) found {len(results)} results")
         else:
-            # Use full vector store with repo_filter
-            results = self.vector_store.search(
+            results = vector_store.search(
                 query_embedding,
                 k=top_k,
                 min_score=self.min_similarity,
@@ -876,18 +939,11 @@ class HybridRetriever:
         Keyword search using BM25
         Uses filtered_bm25 if available, otherwise uses full_bm25
         """
-        # Choose which BM25 index to use
-        if self.filtered_bm25 is not None and len(self.filtered_bm25_elements) > 0:
-            # Use filtered BM25
-            bm25_index = self.filtered_bm25
-            bm25_elements = self.filtered_bm25_elements
-            # CRITICAL FIX: Always apply repo_filter check for safety, even with filtered index
+        bm25_index, bm25_elements, is_filtered = self._active_bm25_state()
+        if is_filtered:
             use_filter = bool(repo_filter)
             self.logger.debug("Using filtered BM25 index")
-        elif self.full_bm25 is not None:
-            # Use full BM25
-            bm25_index = self.full_bm25
-            bm25_elements = self.full_bm25_elements
+        elif bm25_index is not None:
             use_filter = bool(repo_filter)
             self.logger.debug("Using full BM25 index")
         else:
@@ -1180,15 +1236,42 @@ class HybridRetriever:
             )
         
         return filtered_results
+
+    def _active_elements(self) -> List[CodeElement]:
+        """Return the active BM25 element set for the current repository scope."""
+        return self._active_retrieval_state().elements
+
+    def _active_vector_store(self):
+        """Return the active vector store and whether it is filtered."""
+        state = self._active_retrieval_state()
+        return state.vector_store, state.is_filtered
+
+    def _active_bm25_state(self) -> Tuple[Optional[BM25Okapi], List[CodeElement], bool]:
+        """Return active BM25 index, active elements, and whether they are filtered."""
+        state = self._active_retrieval_state()
+        return state.bm25_index, state.elements, state.is_filtered
+
+    def _active_retrieval_state(self) -> ActiveRetrievalState:
+        """Return a single coherent view over the active retrieval indexes."""
+        has_filtered_vector = (
+            self.filtered_vector_store is not None and self.filtered_vector_store.get_count() > 0
+        )
+        has_filtered_bm25 = (
+            self.filtered_bm25 is not None and len(self.filtered_bm25_elements) > 0
+        )
+        is_filtered = has_filtered_vector or has_filtered_bm25
+        return ActiveRetrievalState(
+            vector_store=self.filtered_vector_store if has_filtered_vector else self.vector_store,
+            bm25_index=self.filtered_bm25 if has_filtered_bm25 else self.full_bm25,
+            elements=self.filtered_bm25_elements if has_filtered_bm25 else self.full_bm25_elements,
+            is_filtered=is_filtered,
+        )
     
     def retrieve_by_file(self, file_path: str) -> List[Dict[str, Any]]:
         """Retrieve all elements from a specific file"""
         results = []
         
-        # Use filtered elements if available, otherwise use full elements
-        elements_to_search = (self.filtered_bm25_elements 
-                             if self.filtered_bm25_elements 
-                             else self.full_bm25_elements)
+        elements_to_search = self._active_elements()
         
         for elem in elements_to_search:
             if elem.file_path == file_path or elem.relative_path == file_path:
@@ -1206,10 +1289,7 @@ class HybridRetriever:
         """Retrieve elements by type"""
         results = []
         
-        # Use filtered elements if available, otherwise use full elements
-        elements_to_search = (self.filtered_bm25_elements 
-                             if self.filtered_bm25_elements 
-                             else self.full_bm25_elements)
+        elements_to_search = self._active_elements()
         
         for elem in elements_to_search:
             if elem.type == element_type:
@@ -1413,8 +1493,7 @@ class HybridRetriever:
         """
         try:
             self.repo_root = repo_root
-            # Pass BM25 elements reference to iterative agent for retrieving indexed details
-            bm25_elements = self.filtered_bm25_elements if self.filtered_bm25_elements else self.full_bm25_elements
+            bm25_elements = self._active_elements()
             self.iterative_agent = IterativeAgent(self.config, self, repo_root, bm25_elements=bm25_elements)
 
             # Set repo stats for iterative agent
@@ -1449,7 +1528,7 @@ class HybridRetriever:
             Dict with repo statistics or None if unavailable
         """
         try:
-            elements = self.filtered_bm25_elements if self.filtered_bm25_elements else self.full_bm25_elements
+            elements = self._active_elements()
             
             if not elements:
                 return None

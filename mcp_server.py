@@ -282,6 +282,10 @@ def code_qa(
             loc = f"L{start}-L{end}" if start and end else ""
             parts.append(f"  - {repo}/{file_path}:{loc} ({name})" if repo else f"  - {file_path}:{loc} ({name})")
 
+    if result.get("retrieval_available") is False:
+        reason = result.get("retrieval_unavailable_reason") or "retrieval unavailable"
+        parts.append(f"\n\n[retrieval_status: unavailable] {reason}")
+
     parts.append(f"\n[session_id: {sid}]")
     return "\n".join(parts)
 

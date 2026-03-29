@@ -31,10 +31,16 @@ class RetrievalResult:
     snippets: list[CodeSnippet] = field(default_factory=list)
     truncated: bool = False
     error: str | None = None
+    available: bool = True
+    unavailable_reason: str | None = None
 
     @property
     def found(self) -> bool:
         return bool(self.snippets)
+
+    @property
+    def unavailable(self) -> bool:
+        return not self.available
 
 
 class CodeRetriever:
@@ -44,15 +50,25 @@ class CodeRetriever:
     all calls return an empty RetrievalResult — no crash, no exception.
     """
 
-    def __init__(self, backend: Any | None = None) -> None:
+    def __init__(
+        self,
+        backend: Any | None = None,
+        *,
+        available: bool | None = None,
+        unavailable_reason: str | None = None,
+    ) -> None:
         """
         Args:
             backend: Optional HybridRetriever-compatible object.
                      If None, retrieval is a safe no-op.
         """
         self._backend = backend
+        self._available = bool(backend is not None) if available is None else bool(available)
+        self._unavailable_reason = unavailable_reason
         if backend is None:
             logger.info("CodeRetriever: no backend provided, running in no-op mode")
+            if self._unavailable_reason is None and not self._available:
+                self._unavailable_reason = "retrieval backend unavailable"
 
     @classmethod
     def from_runtime_config(cls, config: dict, repo_root: str | Path | None = None) -> "CodeRetriever":
@@ -74,10 +90,10 @@ class CodeRetriever:
                 config, vs, emb, gb,
                 repo_root=str(repo_root) if repo_root else None,
             )
-            return cls(backend)
+            return cls(backend, available=True)
         except Exception as exc:  # noqa: BLE001
             logger.warning("CodeRetriever.from_runtime_config failed, using no-op: %s", exc)
-            return cls(backend=None)
+            return cls(backend=None, available=False, unavailable_reason=str(exc))
 
     @classmethod
     def from_legacy(cls, config: dict, repo_root: str | Path | None = None) -> "CodeRetriever":
@@ -90,7 +106,11 @@ class CodeRetriever:
         Always returns a RetrievalResult — never raises.
         """
         if self._backend is None:
-            return RetrievalResult(query=query)
+            return RetrievalResult(
+                query=query,
+                available=self._available,
+                unavailable_reason=self._unavailable_reason,
+            )
 
         try:
             raw = self._backend.retrieve(query, top_k=max_results)
@@ -105,11 +125,11 @@ class CodeRetriever:
                 )
                 for item in (raw or [])
             ]
-            return RetrievalResult(query=query, snippets=snippets)
+            return RetrievalResult(query=query, snippets=snippets, available=True)
         except Exception as exc:  # noqa: BLE001
             logger.warning("CodeRetriever.retrieve failed: %s", exc)
-            return RetrievalResult(query=query, error=str(exc))
+            return RetrievalResult(query=query, error=str(exc), available=True)
 
     def is_available(self) -> bool:
-        """Return True — CodeRetriever always degrades gracefully."""
-        return True
+        """Return whether a real retrieval backend is available."""
+        return self._available and self._backend is not None

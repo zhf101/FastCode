@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from fastcode.graph.models import GraphNode, KnowledgeGraph, Layer, TourStep
 from fastcode.graph import search
+from fastcode.graph_services.tour_service import generate_heuristic_tour
 
 
 @dataclass
@@ -21,12 +23,7 @@ class OnboardingContext:
 
 def build_onboarding_context(graph: KnowledgeGraph) -> OnboardingContext:
     """Build an onboarding context from the graph, reusing layers and tour."""
-    # Entry points: file nodes or zero-indegree nodes
-    has_incoming = {e.target for e in graph.edges}
-    entry_nodes = [
-        n for n in graph.nodes
-        if n.id not in has_incoming and n.type in ("file", "module", "function")
-    ][:5]
+    entry_nodes = _collect_entry_points(graph)
 
     # Key nodes: high complexity or many connections
     degree: dict[str, int] = {}
@@ -35,9 +32,11 @@ def build_onboarding_context(graph: KnowledgeGraph) -> OnboardingContext:
         degree[e.target] = degree.get(e.target, 0) + 1
     key_nodes = sorted(
         graph.nodes,
-        key=lambda n: (n.complexity == "high", degree.get(n.id, 0)),
+        key=lambda n: (n.id in {entry.id for entry in entry_nodes}, n.complexity == "high", degree.get(n.id, 0)),
         reverse=True,
     )[:8]
+
+    tour_steps = graph.tour or generate_heuristic_tour(graph)
 
     return OnboardingContext(
         project_name=graph.project.name,
@@ -46,9 +45,78 @@ def build_onboarding_context(graph: KnowledgeGraph) -> OnboardingContext:
         frameworks=graph.project.frameworks,
         entry_points=entry_nodes,
         layers=graph.layers,
-        tour_steps=graph.tour,
+        tour_steps=tour_steps,
         key_nodes=key_nodes,
     )
+
+
+def _collect_entry_points(graph: KnowledgeGraph) -> list[GraphNode]:
+    """Collect likely entry points using project metadata first, then topology."""
+    matched: list[GraphNode] = []
+    seen: set[str] = set()
+
+    for entry in graph.project.entry_points:
+        for node in _match_entry_point_nodes(graph, entry):
+            if node.id not in seen:
+                matched.append(node)
+                seen.add(node.id)
+
+    for node in _zero_indegree_entry_nodes(graph):
+        if node.id not in seen:
+            matched.append(node)
+            seen.add(node.id)
+
+    return matched[:5]
+
+
+def _match_entry_point_nodes(graph: KnowledgeGraph, entry_point: str) -> list[GraphNode]:
+    """Match configured project entry points against graph nodes."""
+    normalized = entry_point.replace("\\", "/").lower()
+    basename = Path(normalized).name
+    stem = Path(basename).stem
+
+    exact_path = [
+        node for node in graph.nodes
+        if node.file_path and node.file_path.replace("\\", "/").lower() == normalized
+    ]
+    if exact_path:
+        return exact_path
+
+    suffix_path = [
+        node for node in graph.nodes
+        if node.file_path and node.file_path.replace("\\", "/").lower().endswith(normalized)
+    ]
+    if suffix_path:
+        return suffix_path
+
+    basename_matches = [
+        node for node in graph.nodes
+        if node.file_path and Path(node.file_path).name.lower() == basename
+    ]
+    if basename_matches:
+        return basename_matches
+
+    return [
+        node for node in graph.nodes
+        if node.name.lower() in {basename, stem}
+    ]
+
+
+def _zero_indegree_entry_nodes(graph: KnowledgeGraph) -> list[GraphNode]:
+    """Fallback entry points based on topology and common entry names."""
+    has_incoming = {e.target for e in graph.edges}
+    candidates = [
+        n for n in graph.nodes
+        if n.id not in has_incoming and n.type in ("file", "module", "function")
+    ]
+
+    def score(node: GraphNode) -> tuple[int, int, str]:
+        name = node.name.lower()
+        common_entry = int(any(token in name for token in ("main", "app", "server", "index", "cli")))
+        type_score = 2 if node.type in ("file", "module") else 1
+        return (common_entry, type_score, name)
+
+    return sorted(candidates, key=score, reverse=True)
 
 
 def format_onboarding_guide(ctx: OnboardingContext) -> str:

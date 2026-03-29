@@ -23,6 +23,8 @@ class AugmentationResult:
     snippets: list[CodeSnippet] = field(default_factory=list)
     reason: str = ""
     error: str | None = None
+    retrieval_available: bool | None = None
+    retrieval_unavailable_reason: str | None = None
 
     @property
     def has_content(self) -> bool:
@@ -58,16 +60,26 @@ class GraphAugmentedRetriever:
         """
         triggered, reason = self._should_augment(graph_context)
         if not triggered:
-            return AugmentationResult(triggered=False, reason=reason)
+            return AugmentationResult(triggered=False, reason=reason, retrieval_available=None)
 
         logger.info("GraphAugmentedRetriever: augmenting — %s", reason)
         result = self._retriever.retrieve(query, max_results=max_results)
+
+        if result.unavailable:
+            return AugmentationResult(
+                triggered=True,
+                reason=reason,
+                error=result.unavailable_reason or "retrieval unavailable",
+                retrieval_available=False,
+                retrieval_unavailable_reason=result.unavailable_reason or "retrieval unavailable",
+            )
 
         if result.error:
             return AugmentationResult(
                 triggered=True,
                 reason=reason,
                 error=result.error,
+                retrieval_available=True,
             )
 
         # Link snippets to graph nodes by file_path match
@@ -84,6 +96,7 @@ class GraphAugmentedRetriever:
             triggered=True,
             snippets=result.snippets,
             reason=reason,
+            retrieval_available=True,
         )
 
     def _should_augment(self, ctx: QueryContext) -> tuple[bool, str]:

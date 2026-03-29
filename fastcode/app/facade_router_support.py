@@ -114,4 +114,6 @@ class GraphFirstRouterSupportMixin:
             "restricted_mode": result.restricted_mode,
             "intent": result.classification.intent.value,
             "intent_confidence": result.classification.confidence,
+            "retrieval_available": result.retrieval_available,
+            "retrieval_unavailable_reason": result.retrieval_unavailable_reason,
         }

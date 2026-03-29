@@ -9,7 +9,7 @@ from fastcode.app.intent_classifier import ClassificationResult, IntentClassifie
 from fastcode.app.service_container import ServiceContainer
 from fastcode.graph.models import GraphNode, ProjectMeta
 from fastcode.graph_services.query_context import QueryContext
-from fastcode.retrieval_runtime.code_retriever import CodeRetriever
+from fastcode.retrieval_runtime.code_retriever import CodeRetriever, CodeSnippet
 from fastcode.retrieval_runtime.context_budget import ContextBudget
 from fastcode.retrieval_runtime.context_packer import ContextPacker
 from fastcode.retrieval_runtime.graph_augmented_retriever import GraphAugmentedRetriever
@@ -25,6 +25,8 @@ class RouteResult:
     graph_ready: bool
     restricted_mode: bool
     sources: list[dict[str, object]]
+    retrieval_available: bool | None = None
+    retrieval_unavailable_reason: str | None = None
 
 
 _EMPTY_META = ProjectMeta(name="unknown", languages=[], frameworks=[], description="")
@@ -83,6 +85,8 @@ class QueryRouter:
                 answer=answer, classification=classification,
                 graph_ready=False, restricted_mode=True,
                 sources=[],
+                retrieval_available=None,
+                retrieval_unavailable_reason=None,
             )
 
         # 3. Load graph + dispatch
@@ -95,17 +99,29 @@ class QueryRouter:
             answer, sources = self._handle_diff(query, graph)
         elif intent == QueryIntent.onboard:
             answer, sources = self._handle_onboard(query, graph)
+            retrieval_available = None
+            retrieval_unavailable_reason = None
         else:
             # graph_qa / hybrid_detail / unknown — use general context + augmentation
             ctx = container.context_builder.build(graph, query)
             answer = self._answering.answer(query, ctx, restricted=False)
-            answer = self._augment_answer(query, ctx, answer, use_agency_mode=use_agency_mode)
+            answer, retrieval_available, retrieval_unavailable_reason = self._augment_answer(
+                query,
+                ctx,
+                answer,
+                use_agency_mode=use_agency_mode,
+            )
             sources = self._sources_from_nodes(graph.project.name, ctx.relevant_nodes)
+        if intent in {QueryIntent.explain, QueryIntent.diff}:
+            retrieval_available = None
+            retrieval_unavailable_reason = None
 
         return RouteResult(
             answer=answer, classification=classification,
             graph_ready=True, restricted_mode=False,
             sources=sources,
+            retrieval_available=retrieval_available,
+            retrieval_unavailable_reason=retrieval_unavailable_reason,
         )
 
     # ------------------------------------------------------------------
@@ -119,51 +135,57 @@ class QueryRouter:
         answer: AnswerResult,
         *,
         use_agency_mode: bool,
-    ) -> AnswerResult:
-        snippets = self._agency_augmentation_snippets(query) if use_agency_mode else self._graph_gap_snippets(query, ctx)
+    ) -> tuple[AnswerResult, bool | None, str | None]:
+        snippets, retrieval_available, retrieval_unavailable_reason = (
+            self._agency_augmentation_snippets(query)
+            if use_agency_mode
+            else self._graph_gap_snippets(query, ctx)
+        )
         if not snippets:
-            return answer
+            return answer, retrieval_available, retrieval_unavailable_reason
 
         packed = self._packer.pack(ctx, snippets)
         augmented_text = answer.answer + "\n\n" + packed.text
-        return AnswerResult(
-            query=answer.query,
-            answer=augmented_text,
-            context_nodes=answer.context_nodes,
-            context_edges=answer.context_edges,
-            restricted_mode=answer.restricted_mode,
+        return (
+            AnswerResult(
+                query=answer.query,
+                answer=augmented_text,
+                context_nodes=answer.context_nodes,
+                context_edges=answer.context_edges,
+                restricted_mode=answer.restricted_mode,
+            ),
+            retrieval_available,
+            retrieval_unavailable_reason,
         )
 
     def _graph_gap_snippets(
         self,
         query: str,
         ctx: QueryContext,
-    ):
+    ) -> tuple[list[CodeSnippet], bool | None, str | None]:
         """Return graph-gap snippets when normal augmentation decides they are needed."""
         aug = self._augmenter.augment_from_graph_gap(query, ctx)
         if not aug.triggered or not aug.has_content:
-            return []
-        return aug.snippets
+            return [], aug.retrieval_available, aug.retrieval_unavailable_reason
+        return aug.snippets, aug.retrieval_available, aug.retrieval_unavailable_reason
 
     def _agency_augmentation_snippets(
         self,
         query: str,
-    ):
+    ) -> tuple[list[CodeSnippet], bool | None, str | None]:
         """Return iterative retrieval snippets for agency-compatible mode."""
         aug = self._iterative.retrieve(query, max_results=10)
+        available = getattr(aug, "available", True)
+        unavailable_reason = getattr(aug, "unavailable_reason", None)
         if aug.error or not aug.snippets:
-            return []
-        return aug.snippets
+            return [], available, unavailable_reason
+        return aug.snippets, available, unavailable_reason
 
     def _handle_explain(self, query: str, graph) -> tuple[AnswerResult, list[dict[str, object]]]:
         from fastcode.graph_services.explain_service import (
-            build_explain_context, format_explain_prompt,
+            build_explain_context, extract_explain_target, format_explain_prompt,
         )
-        # Extract target name: everything after "explain" / "解释" keywords
-        import re
-        target = re.sub(
-            r"(?i)(explain|解释|说明|describe)[\s:：]*(一下|下)?", "", query
-        ).strip() or query
+        target = extract_explain_target(query)
         ctx = build_explain_context(graph, target)
         if ctx is None:
             text = f"No node matching {target!r} found in the graph."

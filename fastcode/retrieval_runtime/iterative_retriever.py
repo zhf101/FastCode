@@ -19,6 +19,8 @@ class IterativeRetrievalResult:
     rounds: int = 0
     snippets: list[CodeSnippet] = field(default_factory=list)
     error: str | None = None
+    available: bool = True
+    unavailable_reason: str | None = None
 
     @property
     def found(self) -> bool:
@@ -57,6 +59,19 @@ class IterativeRetriever:
             result: RetrievalResult = self._retriever.retrieve(
                 current_query, max_results=max_results,
             )
+            if result.unavailable:
+                logger.warning(
+                    "IterativeRetriever: round %d unavailable: %s",
+                    rounds,
+                    result.unavailable_reason,
+                )
+                return IterativeRetrievalResult(
+                    query=query,
+                    rounds=rounds,
+                    snippets=all_snippets,
+                    available=False,
+                    unavailable_reason=result.unavailable_reason,
+                )
             if result.error:
                 logger.warning("IterativeRetriever: round %d error: %s", rounds, result.error)
                 break
@@ -79,4 +94,5 @@ class IterativeRetriever:
             query=query,
             rounds=rounds,
             snippets=all_snippets,
+            available=True,
         )

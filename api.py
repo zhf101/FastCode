@@ -57,6 +57,8 @@ class QueryResponse(BaseModel):
     completion_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
     session_id: Optional[str] = None
+    retrieval_available: Optional[bool] = None
+    retrieval_unavailable_reason: Optional[str] = None
 
 
 class LoadRepositoriesRequest(BaseModel):
@@ -489,6 +491,8 @@ async def query_repository(request: QueryRequest):
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
             session_id=session_id,
+            retrieval_available=result.get("retrieval_available"),
+            retrieval_unavailable_reason=result.get("retrieval_unavailable_reason"),
         )
 
     except Exception as e:
@@ -542,7 +546,9 @@ async def query_repository_stream(request: QueryRequest):
                             "type": "done",
                             "sources": serialized_sources,
                             "context_elements": metadata.get("context_elements", 0),
-                            "session_id": session_id
+                            "session_id": session_id,
+                            "retrieval_available": metadata.get("retrieval_available"),
+                            "retrieval_unavailable_reason": metadata.get("retrieval_unavailable_reason"),
                         }
                     elif "error" in metadata:
                         event_data = {"type": "error", "error": metadata["error"]}
